@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>IMU 3D Viewer</title>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <style>
+        body, html { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+        #renderCanvas { width: 100%; height: 100%; touch-action: none; }
+    </style>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <script>
+        const canvas = document.getElementById("renderCanvas");
+        const engine = new BABYLON.Engine(canvas, true);
+
+        const createScene = function() {
+            const scene = new BABYLON.Scene(engine);
+            const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI/2, Math.PI/2.5, 5, new BABYLON.Vector3(0, 0, 0), scene);
+            camera.attachControl(canvas, true);
+            new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+
+            // --- GLOBAL COORDINATE SYSTEM ---
+            // Displays world axes: Red=X (Right), Green=Y (Up), Blue=Z (Forward)
+            const globalAxes = new BABYLON.AxesViewer(scene, 2);
+            
+            // Ground plane
+            const ground = BABYLON.MeshBuilder.CreateGround("ground", {width: 10, height: 10}, scene);
+            ground.position.y = -2;
+            const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
+            groundMat.wireframe = true;
+            groundMat.diffuseColor = new BABYLON.Color3(0.5, 0.5, 0.5);
+            ground.material = groundMat;
+            
+            // --- ROOT NODE FOR ARM KINEMATICS ---
+            // Rotates the visualization by -90 deg on the X-axis
+            const rootNode = new BABYLON.TransformNode("rootNode", scene);
+            rootNode.rotation.x = -Math.PI / 2;
+            
+            // --- BASE SENSOR ---
+            const box0 = BABYLON.MeshBuilder.CreateBox("sensor0", {width: 1.2, height: 0.4, depth: 0.8}, scene);
+            box0.parent = rootNode;
+            const mat0 = new BABYLON.StandardMaterial("mat0", scene);
+            mat0.diffuseColor = new BABYLON.Color3(0.5, 0.5, 0.5); 
+            box0.material = mat0;
+
+            // --- JOINT 1 (Shoulder) ---
+            const joint1 = new BABYLON.TransformNode("joint1", scene);
+            joint1.parent = box0;
+            joint1.position.x = 0.8;
+            
+            // 1st DOF Cylinder (Shoulder abduction/adduction)
+            const cyl1 = BABYLON.MeshBuilder.CreateCylinder("cyl1", {height: 1.2, diameter: 0.35}, scene);
+            cyl1.parent = box0;
+            cyl1.position.x = 0.8;
+            cyl1.rotation.y = Math.PI / 2;
+            const cyl1Mat = new BABYLON.StandardMaterial("cyl1Mat", scene);
+            cyl1Mat.diffuseColor = new BABYLON.Color3(0.8, 0.8, 0.8);
+            cyl1.material = cyl1Mat;
+
+            // 2nd DOF Cylinder (Shoulder flexion/extension)
+            const cyl1_2 = BABYLON.MeshBuilder.CreateCylinder("cyl1_2", {height: 1.2, diameter: 0.35}, scene);
+            cyl1_2.parent = joint1;
+            cyl1_2.rotation.z = Math.PI / 2;
+            cyl1_2.material = cyl1Mat;
+
+            // --- UPPER ARM SENSOR ---
+            const box1 = BABYLON.MeshBuilder.CreateBox("sensor1", {width: 1, height: 0.3, depth: 1.6}, scene);
+            box1.parent = joint1;
+            box1.position.z = 0.975;
+            const mat1 = new BABYLON.StandardMaterial("mat1", scene);
+            mat1.diffuseColor = new BABYLON.Color3(0, 0.5, 1); 
+            box1.material = mat1;
+
+            // --- JOINT 2 (Elbow) ---
+            const joint2 = new BABYLON.TransformNode("joint2", scene);
+            joint2.parent = joint1;
+            joint2.position.z = 1.95;
+            
+            // Elbow joint axis cylinder
+            const cyl2 = BABYLON.MeshBuilder.CreateCylinder("cyl2", {height: 1.0, diameter: 0.3}, scene);
+            cyl2.parent = joint2;
+            cyl2.rotation.z = Math.PI / 2;
+            const cyl2Mat = new BABYLON.StandardMaterial("cyl2Mat", scene);
+            cyl2Mat.diffuseColor = new BABYLON.Color3(0.8, 0.8, 0.8);
+            cyl2.material = cyl2Mat;
+
+            // --- FOREARM SENSOR ---
+            const box2 = BABYLON.MeshBuilder.CreateBox("sensor2", {width: 0.8, height: 0.25, depth: 1.4}, scene);
+            box2.parent = joint2;
+            box2.position.z = 0.85;
+            const mat2 = new BABYLON.StandardMaterial("mat2", scene);
+            mat2.diffuseColor = new BABYLON.Color3(1, 0.5, 0); 
+            box2.material = mat2;
+
+            // --- LOCAL COORDINATE SYSTEMS ON SENSORS ---
+            // Helper function to attach fixed RGB axis lines to an object
+            // Ensures axes rotate exactly as the boxes (Red=X, Green=Y, Blue=Z)
+            function createLocalAxes(parentMesh, length) {
+                var axisX = BABYLON.MeshBuilder.CreateLines("axisX", {points: [BABYLON.Vector3.Zero(), new BABYLON.Vector3(length, 0, 0)]}, scene);
+                axisX.color = new BABYLON.Color3(1, 0, 0);
+                axisX.parent = parentMesh;
+                
+                var axisY = BABYLON.MeshBuilder.CreateLines("axisY", {points: [BABYLON.Vector3.Zero(), new BABYLON.Vector3(0, length, 0)]}, scene);
+                axisY.color = new BABYLON.Color3(0, 1, 0);
+                axisY.parent = parentMesh;
+                
+                var axisZ = BABYLON.MeshBuilder.CreateLines("axisZ", {points: [BABYLON.Vector3.Zero(), new BABYLON.Vector3(0, 0, length)]}, scene);
+                axisZ.color = new BABYLON.Color3(0, 0, 1);
+                axisZ.parent = parentMesh;
+            }
+
+            // Achsen an unsere Gelenke/Segmente anheften (Länge: 2 Einheiten)
+            createLocalAxes(box0, 2);
+            createLocalAxes(joint1, 2); // <-- Sitzt jetzt perfekt im Gelenk!
+            createLocalAxes(joint2, 2); // <-- Sitzt jetzt perfekt im Gelenk!
+
+            const socket = new WebSocket('ws://localhost:9000');
+            
+            socket.onmessage = function(event) {
+                try {
+                    const msg = JSON.parse(event.data);
+                    const updates = msg.updates;
+
+                    const data0 = updates['mein_viewer/sensor0'];
+                    const data1 = updates['mein_viewer/sensor1'];
+                    const data2 = updates['mein_viewer/sensor2'];
+
+                    // 0. Schulter (Box 0) absolut setzen
+                    if (data0) {
+                        const q0 = data0.quaternion;
+                        if (!box0.rotationQuaternion) box0.rotationQuaternion = new BABYLON.Quaternion();
+                        box0.rotationQuaternion.copyFromFloats(q0[1], q0[2], q0[3], q0[0]);
+                    }
+
+                    // 1. Oberarm (Box 1) relativ zur Schulter setzen
+                    if (data1) {
+                        // Die Rotation wird jetzt auf das GELENK (Top-Node) angewendet, nicht aufs Mesh
+                        const q1_lokal = data1.quaternion;
+                        if (!joint1.rotationQuaternion) joint1.rotationQuaternion = new BABYLON.Quaternion();
+                        joint1.rotationQuaternion.copyFromFloats(q1_lokal[1], q1_lokal[2], q1_lokal[3], q1_lokal[0]);
+                    }
+
+                    // 2. Unterarm (Box 2) relativ zum Oberarm setzen
+                    if (data2) {
+                        const q2_lokal = data2.quaternion;
+                        let quat = new BABYLON.Quaternion(q2_lokal[1], q2_lokal[2], q2_lokal[3], q2_lokal[0]);
+                        
+                        if (!joint2.rotationQuaternion) joint2.rotationQuaternion = new BABYLON.Quaternion();
+                        // Python liefert uns jetzt das fertig berechnete lokale r_joint Quaternion!
+                        // Die Drehung findet jetzt direkt im Python-Backend statt, daher nehmen wir hier einfach die rohen Float-Werte
+                        joint2.rotationQuaternion.copyFromFloats(q2_lokal[1], q2_lokal[2], q2_lokal[3], q2_lokal[0]);
+                    }
+                } catch (e) { console.warn(e); }
+            };
+
+            return scene;
+        };
+
+        const scene = createScene();
+        engine.runRenderLoop(() => scene.render());
+        window.addEventListener("resize", () => engine.resize());
+    </script>
+</body>
+</html>

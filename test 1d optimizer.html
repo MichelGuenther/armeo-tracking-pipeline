@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>IMU 3D Viewer</title>
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <style>
+        body, html { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+        #renderCanvas { width: 100%; height: 100%; touch-action: none; }
+    </style>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <script>
+        const canvas = document.getElementById("renderCanvas");
+        const engine = new BABYLON.Engine(canvas, true);
+
+        const createScene = function() {
+            const scene = new BABYLON.Scene(engine);
+            const camera = new BABYLON.ArcRotateCamera("camera", -Math.PI/2, Math.PI/2.5, 5, new BABYLON.Vector3(0, 0, 0), scene);
+            camera.attachControl(canvas, true);
+            new BABYLON.HemisphericLight("light", new BABYLON.Vector3(0, 1, 0), scene);
+            
+            // --- BOX 0 (Rumpf / Base) ---
+            const box0 = BABYLON.MeshBuilder.CreateBox("sensor0", {width: 1.2, height: 0.4, depth: 1.2}, scene);
+            const mat0 = new BABYLON.StandardMaterial("mat0", scene);
+            mat0.diffuseColor = new BABYLON.Color3(0.5, 0.5, 0.5); 
+            box0.material = mat0;
+            
+            // --- BOX 1 (z.B. Oberarm) ---
+            const box1 = BABYLON.MeshBuilder.CreateBox("sensor1", {width: 1, height: 0.3, depth: 1.6}, scene);
+            const mat1 = new BABYLON.StandardMaterial("mat1", scene);
+            mat1.diffuseColor = new BABYLON.Color3(0, 0.5, 1); 
+            box1.material = mat1;
+
+            // --- BOX 2 (z.B. Unterarm) ---
+            const box2 = BABYLON.MeshBuilder.CreateBox("sensor2", {width: 0.8, height: 0.25, depth: 1.4}, scene);
+            const mat2 = new BABYLON.StandardMaterial("mat2", scene);
+            mat2.diffuseColor = new BABYLON.Color3(1, 0.5, 0); 
+            box2.material = mat2;
+
+            // PARENTING: Box 1 an Box 0, Box 2 an Box 1
+            box1.parent = box0;
+            box1.position.z = 1.0; 
+
+            box2.parent = box1;
+            box2.position.z = 1.5; // Verschiebung zum Ende der ersten Box
+
+            const socket = new WebSocket('ws://localhost:9000');
+            
+            socket.onmessage = function(event) {
+                try {
+                    const msg = JSON.parse(event.data);
+                    const updates = msg.updates;
+
+                    const data0 = updates['mein_viewer/sensor0'];
+                    const data1 = updates['mein_viewer/sensor1'];
+                    const data2 = updates['mein_viewer/sensor2'];
+
+                    // 0. Base (Box 0) absolut setzen
+                    if (data0) {
+                        const q0 = data0.quaternion;
+                        box0.rotationQuaternion = new BABYLON.Quaternion(q0[1], q0[2], q0[3], q0[0]);
+                    }
+
+                    // 1. Oberarm (Box 1) relativ zur Base setzen
+                    if (data1) {
+                        const q1_lokal = data1.quaternion;
+                        box1.rotationQuaternion = new BABYLON.Quaternion(q1_lokal[1], q1_lokal[2], q1_lokal[3], q1_lokal[0]);
+                    }
+
+                    // 2. Unterarm (Box 2) relativ zum Oberarm setzen
+                    if (data2) {
+                        const q2_lokal = data2.quaternion;
+                        // Python liefert uns jetzt das fertig berechnete lokale r_joint Quaternion!
+                        box2.rotationQuaternion = new BABYLON.Quaternion(q2_lokal[1], q2_lokal[2], q2_lokal[3], q2_lokal[0]);
+                    }
+                } catch (e) { console.warn(e); }
+            };
+
+            return scene;
+        };
+
+        const scene = createScene();
+        engine.runRenderLoop(() => scene.render());
+        window.addEventListener("resize", () => engine.resize());
+    </script>
+</body>
+</html>
