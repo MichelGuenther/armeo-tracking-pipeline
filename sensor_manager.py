@@ -24,60 +24,61 @@ class SensorManager:
         """Behandelt den asynchronen Datenstrom für einen einzelnen Sensor."""
         try:
             # 1. Startphase stark simplifiziert, angelehnt an das Originalskript von SensorStim
-            print(f"🔄 Warte auf BLE Lock für: {sensor_id}...")
+            print(f"🔄 Initialisiere Sensor: {sensor_id}...", flush=True)
             
             init_success = False
-            for sub_attempt in range(5): 
+            for sub_attempt in range(3): 
                 try:
-                    # Der Lock ist PFLICHT für Windows! Sonst blockiert der BLE Stack durch parallele GATT Commands
+                    print(f"   [{sensor_id}] Init-Versuch {sub_attempt+1}/3", flush=True)
+                    # Der Lock verhindert parallele GATT Commands auf Linux
                     async with self._init_lock:
-                        print(f"   [{sensor_id}] Versuch {sub_attempt+1} -> Sende init() im Sicherheits-Lock...")
-                        await asyncio.wait_for(imu.init(setTime=True, abortRecording=True, abortStreaming=True), timeout=12.0)
-                        await asyncio.sleep(0.5) # Kurze Atempause für Windows nach dem Init
+                        print(f"   [{sensor_id}] Lock erhalten, sende init()...", flush=True)
+                        await asyncio.wait_for(imu.init(setTime=True, abortRecording=True, abortStreaming=True), timeout=8.0)
+                        await asyncio.sleep(1.0) # Kurze Atempause für BlueZ nach dem Init
                         
+                    print(f"   ✅ [{sensor_id}] Init erfolgreich", flush=True)
                     init_success = True
                     break
+                except asyncio.TimeoutError:
+                    print(f"   ⚠️ [{sensor_id}] Init-Timeout in Versuch {sub_attempt+1}", flush=True)
+                    await asyncio.sleep(2.0)
                 except Exception as e:
-                    print(f"   ⚠️ Timeout/Fehler bei {sensor_id} in Init-Schleife: {type(e).__name__}. Wiederhole Befehl...")
-                    await asyncio.sleep(1.0)
+                    print(f"   ⚠️ [{sensor_id}] Init-Fehler: {type(e).__name__}: {e}", flush=True)
+                    await asyncio.sleep(2.0)
 
             if not init_success:
                 raise ConnectionError(f"Alle Init-Versuche für {sensor_id} fehlgeschlagen.")
 
-            # Da wir jetzt ein Lock haben, ist der Sensor sauber!
-            await asyncio.sleep(0.5)
-            
-            # WICHTIG: Wir blockieren hier JEDEN Sensor und warten bis alle durch die Init-Schleife sind.
-            # Wenn 1 Sensor mit 100Hz auf dem Dongle spammt, bekommen die anderen sonst Timeout beim Init!
-            print(f"⏳ [{sensor_id}] Initialisiert! Warte an der Start-Barriere auf alle anderen Sensoren...")
-            await asyncio.to_thread(lambda: None) # Erlaube Kontextwechsel
+            print(f"⏳ [{sensor_id}] Warte an der Start-Barriere auf alle anderen Sensoren...", flush=True)
             await self._stream_start_barrier.wait()
             
-            print(f"🚀 [{sensor_id}] Startschuss: Sende CmdSetMeasurementMode (100Hz)...")
+            print(f"🚀 [{sensor_id}] Startschuss: Sende CmdSetMeasurementMode...", flush=True)
             async with self._init_lock:
                 await asyncio.wait_for(imu.send(c2g.pkg.CmdSetMeasurementMode(
-                timestamp=0,
-                fullFloat200HzEnabled=False,
-                fullFixedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
-                fullPackedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
-                quatFloatMode=c2g.pkg.SamplingMode.MODE_100HZ,
-                quatFixedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
-                quatPackedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
-                statusMode=1,
-                calibDataMode=c2g.pkg.CalibrationDataMode.CALIB_DATA_DISABLED,
-                processExtensionMode=c2g.pkg.ProcessExtensionMode.NO_EXTENSION,
-                syncMode=c2g.pkg.SyncMode.NO_SYNC,
-                syncId=0,
-                disableBiasEstimation=False,
-                disableMagDistRejection=False,
-                disableMagData=True,
-            )), timeout=10.0)
+                    timestamp=0,
+                    fullFloat200HzEnabled=False,
+                    fullFixedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
+                    fullPackedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
+                    quatFloatMode=c2g.pkg.SamplingMode.MODE_200HZ,
+                    quatFixedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
+                    quatPackedMode=c2g.pkg.SamplingMode.MODE_DISABLED,
+                    statusMode=1,
+                    calibDataMode=c2g.pkg.CalibrationDataMode.CALIB_DATA_DISABLED,
+                    processExtensionMode=c2g.pkg.ProcessExtensionMode.NO_EXTENSION,
+                    syncMode=c2g.pkg.SyncMode.NO_SYNC,
+                    syncId=0,
+                    disableBiasEstimation=False,
+                    disableMagDistRejection=False,
+                    disableMagData=True,
+                )), timeout=8.0)
+                
+                await asyncio.wait_for(imu.send(c2g.pkg.CmdStartStreaming()), timeout=8.0)
             
-                await asyncio.wait_for(imu.send(c2g.pkg.CmdStartStreaming()), timeout=10.0)
+            print(f"📊 [{sensor_id}] Streaming gestartet, warte auf Daten...", flush=True)
             
         except Exception as e:
-            msg = f"\n❌ FEHLER: {sensor_id} konnte nicht gestartet werden! Trenne Verbindung. Fehler: {type(e).__name__} - {e}\n"
-            print(msg)
+            msg = f"\n❌ FEHLER: {sensor_id} konnte nicht gestartet werden! {type(e).__name__} - {e}\n"
+            print(msg, flush=True)
             raise ConnectionError(msg)
         
         packet_count = 0
@@ -179,11 +180,11 @@ class SensorManager:
                         except: pass
                     await asyncio.sleep(1.0)
                 
-                # Die eigentliche Verbindung (mit Timeout, falls Windows sich aufhängt)
+                # Die eigentliche Verbindung: Nutze custom connect mit sequentiellen Verbindungen für Linux
                 try:
-                    self.imus = await asyncio.wait_for(c2g.connect(self.sensor_ids), timeout=35.0)
+                    self.imus = await self._connect_with_sequential_retry(self.sensor_ids)
                 except asyncio.TimeoutError:
-                    print("⚠️ Timeout beim Verbinden der Sensoren (35s ausgereizt). Windows Bluetooth Stack hängt. Neustart des Connects...")
+                    print("⚠️ Timeout beim Verbinden der Sensoren (35s ausgereizt). Bluetooth Stack hängt. Neustart des Connects...")
                     self.imus = []
                 
                 if len(self.imus) == len(self.sensor_ids):
@@ -223,7 +224,7 @@ class SensorManager:
                     return # Bricht die Retry-Schleife nach Erfolg ab
                 else:
                     print(f"⚠️ Nur {len(self.imus)} von {len(self.sensor_ids)} verbunden. Breche ab und probiere es erneut, um Hänger zu vermeiden...")
-                    # Kurze Pause für den Dongle/Windows-Stack, um sich zu erholen
+                    # Kurze Pause für den Dongle/Bluetooth-Stack, um sich zu erholen
                     await asyncio.sleep(2.0)
                     
             except Exception as e:
@@ -231,6 +232,73 @@ class SensorManager:
                 await asyncio.sleep(2.0)
                 
         raise ConnectionError("\n❌ FEHLER: Es konnten nach mehreren Versuchen nicht alle Sensoren verbunden werden. Bitte aus/einschalten!\n")
+
+    async def _connect_with_sequential_retry(self, names):
+        """
+        Custom connect logic optimized for Linux/BlueZ. 
+        Sequentiell verbinden statt parallel (asyncio.gather) verhindert Bluetooth-Stack-Überlastung.
+        """
+        print("🔍 Starte Sensor-Suche...")
+        devices = {}
+        for name in names:
+            if name.startswith('IMU_'):
+                devices[name] = None
+        
+        # Scan für Geräte mit Timeout
+        from capture2go.ble import BleScanner
+        scanner = BleScanner()
+        scan_timeout = 45.0
+        scan_start = time.time()
+        
+        try:
+            async for found in scanner.scan():
+                devices.update(found)
+                missing = [name for name in names if devices[name] is None]
+                print(f'Devices: {found}, missing: {", ".join(missing) if missing else "none"}.')
+                if names and not missing:
+                    print('✅ Alle Geräte gefunden, starte sequentielles Verbinden...')
+                    break
+                
+                # Timeout für die ganze Scan-Phase
+                if time.time() - scan_start > scan_timeout:
+                    print(f'⚠️ Scan-Timeout nach {scan_timeout}s. Nutze gefundene Geräte.')
+                    break
+        except Exception as e:
+            print(f"❌ Fehler beim Scannen: {e}")
+            raise
+        
+        # Sequentiell (nicht parallel!) verbinden für Linux-Stabilität
+        deviceList = [device for name in names if (device := devices[name]) is not None]
+        
+        if len(deviceList) != len(names):
+            missing = [name for name in names if devices[name] is None]
+            raise RuntimeError(f"Nicht alle Geräte gefunden: {missing}")
+        
+        print(f"🔗 Verbinde {len(deviceList)} Sensoren sequentiell...")
+        for idx, imu in enumerate(deviceList, 1):
+            try:
+                # Präventives Trennen: Löst das Problem, dass der allererste Versuch fehlschlägt,
+                # weil der Linux-Bluetooth-Stack noch "Geister-Verbindungen" vom letzten Skript-Start hält.
+                print(f"   [{idx}/{len(deviceList)}] Bereinige alte Verbindungsreste für {imu.name}...", flush=True)
+                try:
+                    await asyncio.wait_for(imu.disconnect(), timeout=2.0)
+                    await asyncio.sleep(0.5)
+                except Exception:
+                    pass
+                
+                print(f"   [{idx}/{len(deviceList)}] Verbinde {imu.name}...", flush=True)
+                await asyncio.wait_for(imu.connect(), timeout=10.0)
+                print(f"   ✅ {imu.name} verbunden", flush=True)
+                await asyncio.sleep(1.0)  # Großzügigere Atempause für BlueZ
+            except asyncio.TimeoutError:
+                print(f"   ❌ Timeout bei {imu.name} nach 10s", flush=True)
+                raise
+            except Exception as e:
+                print(f"   ❌ Fehler bei {imu.name}: {type(e).__name__}: {e}", flush=True)
+                raise
+        
+        print("✅ Alle Sensoren erfolgreich verbunden.")
+        return deviceList
 
 # --- Test-Block: Führe diese Datei direkt aus, um zu prüfen, ob die Sensoren Daten senden ---
 if __name__ == "__main__":

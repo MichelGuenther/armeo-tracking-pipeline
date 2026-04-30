@@ -6,7 +6,7 @@ import os
 
 def main():
     parser = argparse.ArgumentParser(description="Plot heading drift from optimizer logs.")
-    parser.add_argument("file", nargs="?", default="drift_log_1D.csv", help="Die CSV-Datei mit den Logs (Standard: drift_log_1D.csv)")
+    parser.add_argument("file", nargs="?", default="logs/session_01_elbow.csv", help="Die CSV-Datei mit den Logs")
     args = parser.parse_args()
 
     if not os.path.exists(args.file):
@@ -23,7 +23,7 @@ def main():
     df['time'] = df['time'] - df['time'].iloc[0]
 
     # Plot erstellen
-    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    fig, axs = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
     fig.suptitle(f"Heading Drift Analyse ({args.file})", fontsize=16)
 
     # 1. Heading Offsets (Roh / Gefiltert)
@@ -50,9 +50,21 @@ def main():
     # 3. Bias Rate (Gier-Drift-Geschwindigkeit)
     axs[2].plot(df['time'], df['b_w'], label="Gelernte Drift-Rate ($b_w$)", color='tab:orange')
     axs[2].set_ylabel("Drift-Rate [Grad / Fenster]")
-    axs[2].set_xlabel("Zeit [Sekunden]")
     axs[2].grid(True)
     axs[2].legend(loc="upper left")
+
+    # 4. Gelenkwinkel / Flexion
+    if 'angle_x' in df.columns:
+        axs[3].plot(df['time'], df['angle_x'], label="Gelenk-Winkel (X)", color='tab:purple')
+    if 'angle_y' in df.columns:
+        axs[3].plot(df['time'], df['angle_y'], label="Gelenk-Winkel (Y)", color='tab:cyan', alpha=0.7)
+    if 'angle_z' in df.columns:
+        axs[3].plot(df['time'], df['angle_z'], label="Gelenk-Winkel (Z)", color='tab:pink', alpha=0.7)
+        
+    axs[3].set_ylabel("Winkel [Grad]")
+    axs[3].set_xlabel("Zeit [Sekunden]")
+    axs[3].grid(True)
+    axs[3].legend(loc="upper left")
 
     plt.tight_layout()
     plt.show()

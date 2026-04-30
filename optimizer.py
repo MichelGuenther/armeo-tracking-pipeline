@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.optimize import minimize_scalar
 from scipy.spatial.transform import Rotation as R
 import time
 import threading
@@ -13,7 +12,7 @@ class Optimizer1D:
     The optimizer collects data in a sliding window and searches for the heading correction angle (delta_yaw) 
     that minimizes the measured movement (variance) on these two "forbidden" axes.
     """
-    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, log_file="drift_log_1D.csv"):
+    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, tau_b_=2.8, tau_delta_=0.7, log_file="drift_log_1D.csv"):
         """
         Initializes the 1D optimizer for a sensor pair.
         
@@ -38,6 +37,7 @@ class Optimizer1D:
             if not os.path.exists(self.log_file):
                 with open(self.log_file, "w") as f:
                     f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val\n")
+                    f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x\n")
         
         # Buffers for the sliding window
         self.buffer_upper = []
@@ -54,9 +54,9 @@ class Optimizer1D:
         self.b_w_minus_1 = 0.0
         self.delta_w_minus_1 = 0.0
         self.delta_f_w_minus_1 = 0.0
-        self.T_s = step_size / 100.0  # Window duration in sec (Assumption: 100 Hz DataFrame)
-        self.tau_b = 2.8              # Tunable time constant for bias filter
-        self.tau_delta = 0.7          # Tunable time constant for heading filter
+        self.T_s = step_size / 200.0  # Window duration in sec (Assumption: 100 Hz DataFrame)
+        self.tau_b = tau_b_              # Tunable time constant for bias filter
+        self.tau_delta = tau_delta_           # Tunable time constant for heading filter
         self.r_min = 0.1              # Empirically tuned threshold for singularity detection
 
     def add_packet_and_optimize(self, r_up_aligned, r_low_aligned):
@@ -136,16 +136,17 @@ class Optimizer1D:
         angle_x = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
         
         upper_bound = np.deg2rad(96.0)
-        lower_bound = np.deg2rad(-55.0)
+        lower_bound = np.deg2rad(-60.0)
         
         # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
         # Excludes mirrored or anatomically impossible orientations (the "second valley")
         # by strictly penalizing states outside valid joint bounds (cf. Eq. 14).
-        is_invalid = (angle_x > upper_bound) | (angle_x < lower_bound)
-        e_k = is_invalid.astype(float)
+        penalty_over = np.maximum(0, angle_x - upper_bound)
+        penalty_under = np.maximum(0, lower_bound - angle_x)
         
         # --- COST FUNCTION (cf. Eq. 17) ---
-        limrom_penalty = np.sum(e_k)
+        # Massive Gewichtung der anatomischen Grenzen, um den 180-Grad-Flip zu blockieren!
+        limrom_penalty = np.sum(penalty_over**2 + penalty_under**2) * 1000.0
         
         cost = np.sum(angle_y**2 + angle_z**2) + limrom_penalty
         
@@ -283,6 +284,7 @@ class Optimizer1D:
                 if self.log_file:
                     with open(self.log_file, "a") as f:
                         f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f}\n")
+                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angle_x_deg:.2f}\n")
                         
         except Exception as e:
             print(f"Error in optimizer thread: {e}")
@@ -297,7 +299,7 @@ class Optimizer2D_Universal:
     The optimizer searches for the heading correction angle (delta_yaw) that minimizes the variance 
     on this single "forbidden" axis.
     """
-    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, log_file="drift_log_2D.csv"):
+    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, tau_b_=2.8, tau_delta_=0.7, log_file="drift_log_2D.csv"):
         self.s_parent = sensor_parent
         self.s_child = sensor_child
         self.window_size = window_size
@@ -305,12 +307,13 @@ class Optimizer2D_Universal:
         self.flat_valley_threshold = flat_valley_threshold
         self.enable_singularity_filter = enable_singularity_filter
         self.log_file = log_file
-        
+
         if self.log_file:
             import os
             if not os.path.exists(self.log_file):
                 with open(self.log_file, "w") as f:
                     f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val\n")
+                    f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,angle_y,angle_z\n")
         
         self.buffer_parent = []
         self.buffer_child = []
@@ -324,9 +327,9 @@ class Optimizer2D_Universal:
         self.b_w_minus_1 = 0.0
         self.delta_w_minus_1 = 0.0
         self.delta_f_w_minus_1 = 0.0
-        self.T_s = step_size / 100.0  # Window duration in sec (Assumption: 100 Hz)
-        self.tau_b = 2.0              # Time constant bias (Eq. 19)
-        self.tau_delta = 0.5          # Time constant heading (Eq. 20)
+        self.T_s = step_size / 200.0  # Window duration in sec (Assumption: 100 Hz DataFrame)
+        self.tau_b = tau_b_             # Tunable time constant for bias filter
+        self.tau_delta = tau_delta_          # Tunable time constant for heading filter
         self.r_min = 0.1              # Empirically tuned threshold for singularity detection
 
     def add_packet_and_optimize(self, r_par_aligned, r_chi_aligned):
@@ -415,7 +418,7 @@ class Optimizer2D_Universal:
                 optimization_success = True
                 cost_fun_val = 0.0
             else:
-                # --- 3-STAGE COARSE-TO-FINE GRID SEARCH (SciPy Replacement) ---
+                # --- 3-STAGE COARSE-TO-FINE GRID SEARCH ---
                 
                 # 1. GROBE SUCHE (36 Punkte, 10° Auflösung)
                 coarse_space = np.linspace(-np.pi, np.pi, 36)
@@ -489,9 +492,16 @@ class Optimizer2D_Universal:
                 self.current_heading_offset = self.target_heading_offset
                 print(f"[{time.strftime('%H:%M:%S')}] 2D Optimizer (Shoulder): Target offset = {np.degrees(self.current_heading_offset):.2f}° (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s)")
                 
+                # Berechne die finalen Euler-Winkel (Schulter) der gefundenen "besten" Lösung
+                rot_offset_best = R.from_euler('z', delta_w, degrees=False)
+                r_rel_best = r_parent_inv * (rot_offset_best * r_child)
+                avg_angles = np.mean(r_rel_best.as_euler('XYZ', degrees=True), axis=0)
+                
+                # Logging
                 if self.log_file:
                     with open(self.log_file, "a") as f:
                         f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f}\n")
+                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angles[0]:.2f},{avg_angles[1]:.2f},{avg_angles[2]:.2f}\n")
             else:
                 print("⚠️ 2D optimization failed for this window.")
         except Exception as e:

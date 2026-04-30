@@ -29,7 +29,7 @@ ID_LOWER = 'IMU_c22f23'  # Forearm           (Sensor 2)
 
 if TRACKING_MODE == 'ALL':
     ACTIVE_SENSORS = [ID_BASE, ID_UPPER, ID_LOWER]
-    SENSOR_HZ = 100
+    SENSOR_HZ = 200
 elif TRACKING_MODE == '1D':
     ACTIVE_SENSORS = [ID_UPPER, ID_LOWER]
     SENSOR_HZ = 100
@@ -46,14 +46,21 @@ OPT_STEP_SIZE = int(SENSOR_HZ * CALCULATION_INTERVAL_SEC)
 
 # ----------------- OPTIMIZER PARAMETERS -----------------
 # Toggle for Flat Valley Detection:
-ENABLE_FLAT_VALLEY_FILTER = False
+ENABLE_FLAT_VALLEY_FILTER = True
 # Threshold for stationary check:
 OPT_FLAT_VALLEY_THRESHOLD = 1e-7
 
 # Heading filter / Singularity filter
 ENABLE_SINGULARITY_FILTER = True
-ENABLE_LOGGING = True
+TAU_B = 2.8
+TAU_DELTA = 0.7
+ENABLE_LOGGING = False
+
+# --- LOGGING CONFIGURATION ---
+ENABLE_LOGGING = False
 LOG_DIR = "logs"
+LOG_FILE_NAME_1D = "session_01_elbow.csv"     # Ändere den Namen hier für jeden neuen Versuch!
+LOG_FILE_NAME_2D = "session_01_shoulder.csv"  # Ändere den Namen hier für jeden neuen Versuch!
 # ------------------------------------------------------------------
 
 # ==============================================================================
@@ -74,7 +81,6 @@ def viewer_process(queue):
     sys.path.insert(0, os.path.join(curr, 'bilbolab', 'robots', 'gimli', 'software', 'GIMLI_Software'))
     
     from extensions.babylon.src.babylon import BabylonVisualization, BabylonObject
-    import webbrowser
     from scipy.spatial.transform import Rotation as R 
 
     class SensorBox(BabylonObject):
@@ -101,11 +107,6 @@ def viewer_process(queue):
         print(f"📡 SERVER-CHECK: Ich lausche auf http://{babylon.server.host}:{babylon.server.port}")
     else:
         print("📡 SERVER-CHECK: Server-Objekt konnte nicht gefunden werden!")
-    
-    # --- AUTO BROWSER START ---
-    time.sleep(2)
-    webbrowser.open("http://127.0.0.1:8000/test.html")
-    # --------------------------
 
     box0 = SensorBox('sensor0') # Repräsentiert ID_BASE
     box1 = SensorBox('sensor1') # Repräsentiert ID_UPPER
@@ -121,6 +122,8 @@ def viewer_process(queue):
             os.makedirs(LOG_DIR)
         log_file_1d = os.path.join(LOG_DIR, "drift_log_1D.csv")
         log_file_2d = os.path.join(LOG_DIR, "drift_log_2D.csv")
+        log_file_1d = os.path.join(LOG_DIR, LOG_FILE_NAME_1D)
+        log_file_2d = os.path.join(LOG_DIR, LOG_FILE_NAME_2D)
 
     # Logik für den Flat Valley Schwellenwert anwenden
     # -1 deaktiviert den Filter vollständig (Flat Valley niemals aktiv)
@@ -133,8 +136,9 @@ def viewer_process(queue):
         window_size=OPT_WINDOW_SIZE, 
         step_size=OPT_STEP_SIZE,
         flat_valley_threshold=flat_valley_threshold,
-        penalty_weight=OPT_PENALTY_WEIGHT,
         enable_singularity_filter=ENABLE_SINGULARITY_FILTER,
+        tau_delta_=TAU_DELTA,
+        tau_b_=TAU_B,
         log_file=log_file_1d
     )
     
@@ -145,24 +149,31 @@ def viewer_process(queue):
         window_size=OPT_WINDOW_SIZE, 
         step_size=OPT_STEP_SIZE,
         flat_valley_threshold=flat_valley_threshold,
-        penalty_weight=OPT_PENALTY_WEIGHT,
         enable_singularity_filter=ENABLE_SINGULARITY_FILTER,
         log_file=log_file_2d
     )
     
     # --- MANUELLE SENSOR-TO-SEGMENT KALIBRIERUNG ---
-    # Vertauschte Y- und Z-Achsen behebst du in der Regel durch eine 90° oder -90° 
-    # Rotation um die X-Achse. Probier hier [90, 0, 0] oder [-90, 0, 0] aus:
-    R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 0], degrees=True) #     R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 180], degrees=True)
-    R_ALIGN_UPPER = R.from_euler('xyz', [-90, 0, 0], degrees=True) #     R_ALIGN_UPPER = R.from_euler('xyz', [-90, 0, 180], degrees=True)
-    R_ALIGN_LOWER = R.from_euler('xyz', [-90, 0, -0], degrees=True) #     R_ALIGN_LOWER = R.from_euler('xyz', [-90, 180, 0], degrees=True)
+    # --- ALTE KONFIGURATION (Auskommentiert, funktionierend) ---
+    # R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 0], degrees=True)
+    # R_ALIGN_UPPER = R.from_euler('xyz', [-90, 0, 0], degrees=True)
+    # R_ALIGN_LOWER = R.from_euler('xyz', [-90, 0, 180], degrees=True)
+    # MIRROR_BASE  = [1, -1, -1] 
+    # MIRROR_UPPER = [1, -1, -1]
+    # MIRROR_LOWER = [-1, 1, -1]
     
-    # --- ACHSEN-INVERTIERUNG (Spiegelung) ---
-    # Wenn eine Achse in die falsche Richtung dreht, ändere hier die 1 zu einer -1
-    # Format: [X, Y, Z]
-    MIRROR_BASE  = [1, -1, -1] 
-    MIRROR_UPPER = [1, -1, -1]
-    MIRROR_LOWER = [-1, 1, -1]
+    # --- NEUE, EFFIZIENTERE KONFIGURATION ---
+    import numpy as np
+    
+    R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 0], degrees=True)
+    R_ALIGN_UPPER = R.from_euler('xyz', [-90, 0, 0], degrees=True)
+    R_ALIGN_LOWER = R.from_euler('xyz', [-90, 0, 180], degrees=True)
+    
+    # NumPy Arrays beschleunigen die Element-weise Multiplikation im Loop massiv.
+    # Format direkt für SciPy bereitgestellt: [X, Y, Z, W]
+    Q_MAP_BASE  = np.array([ 1, -1, -1, 1], dtype=np.float32) 
+    Q_MAP_UPPER = np.array([ 1, -1, -1, 1], dtype=np.float32)
+    Q_MAP_LOWER = np.array([-1,  1, -1, 1], dtype=np.float32)
     
     packet_count = 0
     last_fps_time = time.time()
@@ -180,15 +191,25 @@ def viewer_process(queue):
                     packet = queue.get_nowait()
                     packet_count += 1
                     
-                    # 1. Roh-Quaternionen aus dem kombinierten Paket extrahieren (fehlende Sensoren bekommen [1,0,0,0])
-                    q_b = packet[ID_BASE].get('quat', [1, 0, 0, 0])  if ID_BASE  in packet else [1, 0, 0, 0]
-                    q_u = packet[ID_UPPER].get('quat', [1, 0, 0, 0]) if ID_UPPER in packet else [1, 0, 0, 0]
-                    q_l = packet[ID_LOWER].get('quat', [1, 0, 0, 0]) if ID_LOWER in packet else [1, 0, 0, 0]
+                    # --- ALTE VERARBEITUNG (Auskommentiert) ---
+                    # q_b = packet[ID_BASE].get('quat', [1, 0, 0, 0])  if ID_BASE  in packet else [1, 0, 0, 0]
+                    # q_u = packet[ID_UPPER].get('quat', [1, 0, 0, 0]) if ID_UPPER in packet else [1, 0, 0, 0]
+                    # q_l = packet[ID_LOWER].get('quat', [1, 0, 0, 0]) if ID_LOWER in packet else [1, 0, 0, 0]
+                    # r_base_raw = R.from_quat([q_b[1]*MIRROR_BASE[0], q_b[2]*MIRROR_BASE[1], q_b[3]*MIRROR_BASE[2], q_b[0]])
+                    # r_up_raw   = R.from_quat([q_u[1]*MIRROR_UPPER[0], q_u[2]*MIRROR_UPPER[1], q_u[3]*MIRROR_UPPER[2], q_u[0]])
+                    # r_low_raw  = R.from_quat([q_l[1]*MIRROR_LOWER[0], q_l[2]*MIRROR_LOWER[1], q_l[3]*MIRROR_LOWER[2], q_l[0]])
+
+                    # --- NEUE EFFIZIENTE VERARBEITUNG ---
+                    # Schnelleres Dictionary-Lookup ohne doppelte 'in' Überprüfung (spart CPU-Zyklen)
+                    q_b = packet.get(ID_BASE, {}).get('quat', [1.0, 0.0, 0.0, 0.0])
+                    q_u = packet.get(ID_UPPER, {}).get('quat', [1.0, 0.0, 0.0, 0.0])
+                    q_l = packet.get(ID_LOWER, {}).get('quat', [1.0, 0.0, 0.0, 0.0])
                     
-                    # SciPy braucht [x, y, z, w]. 
-                    r_base_raw = R.from_quat([q_b[1]*MIRROR_BASE[0], q_b[2]*MIRROR_BASE[1], q_b[3]*MIRROR_BASE[2], q_b[0]])
-                    r_up_raw   = R.from_quat([q_u[1]*MIRROR_UPPER[0], q_u[2]*MIRROR_UPPER[1], q_u[3]*MIRROR_UPPER[2], q_u[0]])
-                    r_low_raw  = R.from_quat([q_l[1]*MIRROR_LOWER[0], q_l[2]*MIRROR_LOWER[1], q_l[3]*MIRROR_LOWER[2], q_l[0]])
+                    # Vektorisierte NumPy-Multiplikation direkt im SciPy [x, y, z, w] Format.
+                    # SciPy akzeptiert das Array nativ (ohne nochmalige Konvertierung).
+                    r_base_raw = R.from_quat(np.array([q_b[1], q_b[2], q_b[3], q_b[0]]) * Q_MAP_BASE)
+                    r_up_raw   = R.from_quat(np.array([q_u[1], q_u[2], q_u[3], q_u[0]]) * Q_MAP_UPPER)
+                    r_low_raw  = R.from_quat(np.array([q_l[1], q_l[2], q_l[3], q_l[0]]) * Q_MAP_LOWER)
                     
                     # 2. Manuelles Alignment (Kalibrierung) applizieren
                     r_base_aligned = r_base_raw * R_ALIGN_BASE

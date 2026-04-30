@@ -11,14 +11,21 @@ import pandas as pd
 # So bleibt das Dashboard übersichtlich!
 # ==========================================
 PLOT_WINDOW_RATING = False       # r_w: Bewegungsintensität (Flat Valley Erkennung)
+PLOT_WINDOW_RATING = True        # r_w: Bewegungsintensität (Flat Valley Erkennung)
 PLOT_SINGULARITY_EVENTS = False  # is_singular: Wann griff der Notfall-Filter ein?
 PLOT_HEADING_CORRECTION = True   # delta_w vs delta_f_w: Rohes vs. gefiltertes Offset
 PLOT_DRIFT_RATE = False          # b_w: Die berechnete konstante Drift-Rate
 PLOT_COST_FUNCTION = True        # result.fun: Wie gut konnte SciPy minimieren? (Fehlerwert)
+PLOT_DRIFT_RATE = True           # b_w: Die berechnete konstante Drift-Rate
+PLOT_COST_FUNCTION = False       # cost_val: Fehlerwert der Zielfunktion
+PLOT_COMPUTATION_TIME = True     # opt_duration: Dauer des Threads in Sekunden
+PLOT_JOINT_ANGLES = True         # angle_x, angle_y, angle_z: Tatsächliche Gelenkwinkel!
 
 LOG_DIR = "logs"
 LOG_FILE_1D = os.path.join(LOG_DIR, "drift_log_1D.csv")
 LOG_FILE_2D = os.path.join(LOG_DIR, "drift_log_2D.csv")
+LOG_FILE_1D = os.path.join(LOG_DIR, "session_01_elbow.csv")
+LOG_FILE_2D = os.path.join(LOG_DIR, "session_01_shoulder.csv")
 UPDATE_INTERVAL_MS = 1000  # Aktualisiere den Plot jede Sekunde
 
 def update_plots(frame, axes, active_plots):
@@ -124,6 +131,37 @@ def update_plots(frame, axes, active_plots):
             ax.grid(True, alpha=0.3)
             plot_idx += 1
 
+        # -------------------------------------------------------------
+        # 6: Computation Time (opt_duration)
+        # -------------------------------------------------------------
+        if PLOT_COMPUTATION_TIME:
+            ax = ax_list[plot_idx]
+            if df_1d is not None and not df_1d.empty and 'opt_duration' in df_1d.columns:
+                ax.plot(df_1d['time'], df_1d['opt_duration'], 'b-', label='1D Opt Time (s)')
+            if df_2d is not None and not df_2d.empty and 'opt_duration' in df_2d.columns:
+                ax.plot(df_2d['time'], df_2d['opt_duration'], 'r-', label='2D Opt Time (s)')
+            ax.set_title("Berechnungszeit pro Fenster [Sekunden]")
+            ax.set_ylabel("Dauer [s]")
+            ax.axhline(0.25, color='gray', linestyle=':', label='Max Time (0.25s)')
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
+        # -------------------------------------------------------------
+        # 7: Joint Angles (Gelenkwinkel)
+        # -------------------------------------------------------------
+        if PLOT_JOINT_ANGLES:
+            ax = ax_list[plot_idx]
+            if df_1d is not None and not df_1d.empty and 'angle_x' in df_1d.columns:
+                ax.plot(df_1d['time'], df_1d['angle_x'], 'b-', label='1D Flexion (Elbow X)')
+            if df_2d is not None and not df_2d.empty and 'angle_y' in df_2d.columns:
+                ax.plot(df_2d['time'], df_2d['angle_y'], 'r-', label='2D Abduction (Shoulder Y)')
+            ax.set_title("Tatsächliche Gelenkwinkel [Grad]")
+            ax.set_ylabel("Winkel [°]")
+            ax.legend(loc="upper right")
+            ax.grid(True, alpha=0.3)
+            plot_idx += 1
+
         # Wenn X-Achsen extrem eng sind, drehe Beschriftung
         for ax in ax_list[:plot_idx]:
             ax.tick_params(axis='x', rotation=45)
@@ -138,6 +176,7 @@ if __name__ == "__main__":
         print(f"Ordner {LOG_DIR} existiert noch nicht. Bitte starte zuerst main.py / test_bridge.py")
         
     active_plots = sum([PLOT_WINDOW_RATING, PLOT_SINGULARITY_EVENTS, PLOT_HEADING_CORRECTION, PLOT_DRIFT_RATE, PLOT_COST_FUNCTION])
+    active_plots = sum([PLOT_WINDOW_RATING, PLOT_SINGULARITY_EVENTS, PLOT_HEADING_CORRECTION, PLOT_DRIFT_RATE, PLOT_COST_FUNCTION, PLOT_COMPUTATION_TIME, PLOT_JOINT_ANGLES])
     
     if active_plots == 0:
         print("Alle Plots sind deaktiviert! Bitte mindestens einen Toggle auf True setzen.")
