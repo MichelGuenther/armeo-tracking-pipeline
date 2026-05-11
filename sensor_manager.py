@@ -29,6 +29,17 @@ class SensorManager:
             init_success = False
             for sub_attempt in range(3): 
                 try:
+                    if sub_attempt > 0:
+                        # User found out: Just resending init doesn't work. We MUST clean the connection first.
+                        print(f"   🧹 [{sensor_id}] Räume Verbindung auf vor weiterem Versuch...", flush=True)
+                        async with self._init_lock:
+                            try: await asyncio.wait_for(imu.disconnect(), timeout=2.0)
+                            except: pass
+                            await asyncio.sleep(1.0)
+                            try: await asyncio.wait_for(imu.connect(), timeout=5.0)
+                            except: pass
+                            await asyncio.sleep(1.0)
+                            
                     print(f"   [{sensor_id}] Init-Versuch {sub_attempt+1}/3", flush=True)
                     # Der Lock verhindert parallele GATT Commands auf Linux
                     async with self._init_lock:
@@ -41,10 +52,8 @@ class SensorManager:
                     break
                 except asyncio.TimeoutError:
                     print(f"   ⚠️ [{sensor_id}] Init-Timeout in Versuch {sub_attempt+1}", flush=True)
-                    await asyncio.sleep(2.0)
                 except Exception as e:
                     print(f"   ⚠️ [{sensor_id}] Init-Fehler: {type(e).__name__}: {e}", flush=True)
-                    await asyncio.sleep(2.0)
 
             if not init_success:
                 raise ConnectionError(f"Alle Init-Versuche für {sensor_id} fehlgeschlagen.")
@@ -174,11 +183,11 @@ class SensorManager:
                 # Wir löschen alle alten BLE-Statusmeldungen aus capture2go mit einem Trick
                 old_imus = getattr(self, 'imus', [])
                 if old_imus:
-                    print("🧹 Räume alte Verbindungen auf bevor ein neuer Versuch startet...")
+                    print("🧹 Räume alte Verbindungen auf bevor ein neuer Versuch startet...", flush=True)
                     for i in old_imus:
-                        try: await asyncio.wait_for(i.disconnect(), timeout=3.0) 
+                        try: await asyncio.wait_for(i.disconnect(), timeout=2.0) 
                         except: pass
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(2.0)
                 
                 # Die eigentliche Verbindung: Nutze custom connect mit sequentiellen Verbindungen für Linux
                 try:
@@ -274,18 +283,20 @@ class SensorManager:
             missing = [name for name in names if devices[name] is None]
             raise RuntimeError(f"Nicht alle Geräte gefunden: {missing}")
         
+        print("🧹 Führe präventives, globales Aufräumen (Disconnect) für ALLE gefundenen Sensoren aus...", flush=True)
+        for idx, imu in enumerate(deviceList, 1):
+            try:
+                print(f"   [{idx}/{len(deviceList)}] Trenne alte Verbindung (falls vorhanden) zu {imu.name}...", flush=True)
+                await asyncio.wait_for(imu.disconnect(), timeout=3.0)
+            except Exception:
+                pass
+        
+        print("   Warte 2 Sekunden, damit der Bluetooth-Stack zur Ruhe kommt...", flush=True)
+        await asyncio.sleep(2.0)
+        
         print(f"🔗 Verbinde {len(deviceList)} Sensoren sequentiell...")
         for idx, imu in enumerate(deviceList, 1):
             try:
-                # Präventives Trennen: Löst das Problem, dass der allererste Versuch fehlschlägt,
-                # weil der Linux-Bluetooth-Stack noch "Geister-Verbindungen" vom letzten Skript-Start hält.
-                print(f"   [{idx}/{len(deviceList)}] Bereinige alte Verbindungsreste für {imu.name}...", flush=True)
-                try:
-                    await asyncio.wait_for(imu.disconnect(), timeout=2.0)
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-                
                 print(f"   [{idx}/{len(deviceList)}] Verbinde {imu.name}...", flush=True)
                 await asyncio.wait_for(imu.connect(), timeout=10.0)
                 print(f"   ✅ {imu.name} verbunden", flush=True)

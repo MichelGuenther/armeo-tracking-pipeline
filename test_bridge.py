@@ -5,6 +5,9 @@ import asyncio
 import multiprocessing
 from multiprocessing import Process, Queue
 import time
+import math
+import numpy as np
+
 
 # --- Imports ---
 from sensor_manager import SensorManager
@@ -39,33 +42,48 @@ elif TRACKING_MODE == '2D':
 
 # Window configuration for optimization
 CALCULATION_INTERVAL_SEC = 0.25
-DATA_WINDOW_SEC = 1
+DATA_WINDOW_SEC = 2
 
 OPT_WINDOW_SIZE = int(SENSOR_HZ * DATA_WINDOW_SEC)
 OPT_STEP_SIZE = int(SENSOR_HZ * CALCULATION_INTERVAL_SEC)
 
 # ----------------- OPTIMIZER PARAMETERS -----------------
 # Toggle for Flat Valley Detection:
-ENABLE_FLAT_VALLEY_FILTER = True
-# Threshold for stationary check:
+ENABLE_FLAT_VALLEY_FILTER = False
+# Threshold for flat valley:
 OPT_FLAT_VALLEY_THRESHOLD = 1e-7
 
-# Heading filter / Singularity filter
+# Singularity filter
 ENABLE_SINGULARITY_FILTER = True
-TAU_B = 2.8
-TAU_DELTA = 0.7
-ENABLE_LOGGING = False
+
+# Anti-Windup filter
+ENABLE_ANTI_WINDUP = True
+
+# LimRoM for 2D Optimizer
+ENABLE_LIMROM_2D = False
+
+TAU_B = 30
+TAU_DELTA = 1
+print(f"Optimierungsparameter: tau_b={TAU_B}, tau_delta={TAU_DELTA}")
+print(f"Filter-Einstellungen: Singularity={ENABLE_SINGULARITY_FILTER}, FlatValley={ENABLE_FLAT_VALLEY_FILTER}, AntiWindup={ENABLE_ANTI_WINDUP}, LimRom2D={ENABLE_LIMROM_2D}")
+
+# Cost function weight for difference in delta
+OPT_DELTA_DELTA_WEIGHT = 0 #OPT_WINDOW_SIZE / math.pi
 
 # --- LOGGING CONFIGURATION ---
 ENABLE_LOGGING = False
-LOG_DIR = "logs"
-LOG_FILE_NAME_1D = "session_01_elbow.csv"     # Ändere den Namen hier für jeden neuen Versuch!
-LOG_FILE_NAME_2D = "session_01_shoulder.csv"  # Ändere den Namen hier für jeden neuen Versuch!
+ENABLE_DEBUG_LOGGING = False
+LOG_DIR = "logs/csv"
+SESSION_NAME = "session_32_tau_b30_tau_delta1_windup_nodeltadelta" # Wird in den Dateinamen der Logs eingebaut
+LOG_FILE_NAME_1D = f"{SESSION_NAME}_1D.csv" # 1D Overall
+LOG_FILE_NAME_2D = f"{SESSION_NAME}_2D.csv"  # 2D Overall
+DEBUG_LOG_FILE_1D = f"{SESSION_NAME}_debug_1D.csv"  # 1D Debug Log
+DEBUG_LOG_FILE_2D = f"{SESSION_NAME}_debug_2D.csv"  # 2D Debug Log
 # ------------------------------------------------------------------
 
 # ==============================================================================
 
-# --- 1. WINDOWS FIXES (Nur im Hauptprozess nötig) ---
+# --- 1. WINDOWS FIXES ---
 def apply_fixes():
     for sig in ['SIGHUP', 'SIGALRM', 'ITIMER_REAL']:
         if not hasattr(signal, sig): setattr(signal, sig, 1)
@@ -92,6 +110,20 @@ def viewer_process(queue):
         def getConfig(self): return {'width': 1, 'height': 0.3, 'depth': 1.6}
         def getData(self): return self.data
 
+    class AngleDisplay(BabylonObject):
+        def __init__(self, id, position=[0,0,0]):
+            super().__init__(id)
+            self.object_type = 'text'
+            self.type = 'text'
+            self.data = {
+                'text': 'Warte auf Daten...',
+                'position': position,
+                'fontSize': 70,
+                'color': '#FFFFFF'
+            }
+        def getConfig(self): return {'font': 'bold 24px Arial'}
+        def getData(self): return self.data
+
     print("🌐 3D-Viewer Prozess startet...")
     
     lib_path = os.path.join(curr, 'bilbolab', 'robots', 'gimli', 'software', 'GIMLI_Software', 'extensions', 'babylon', 'src')
@@ -108,15 +140,24 @@ def viewer_process(queue):
     else:
         print("📡 SERVER-CHECK: Server-Objekt konnte nicht gefunden werden!")
 
-    box0 = SensorBox('sensor0') # Repräsentiert ID_BASE
-    box1 = SensorBox('sensor1') # Repräsentiert ID_UPPER
-    box2 = SensorBox('sensor2') # Repräsentiert ID_LOWER
+    box0 = SensorBox('sensor0') # ID_BASE
+    box1 = SensorBox('sensor1') # ID_UPPER
+    box2 = SensorBox('sensor2') # ID_LOWER
     babylon.addObject(box0)
     babylon.addObject(box1)
     babylon.addObject(box2)
 
+    # Text-Objekte für die Winkelanzeige (Positionen können hier angepasst werden)
+    text_shoulder = AngleDisplay('text_shoulder', position=[0, 2.5, -2])
+    text_elbow = AngleDisplay('text_elbow', position=[0, 1.5, -2])
+    babylon.addObject(text_shoulder)
+    babylon.addObject(text_elbow)
+
     log_file_1d = None
     log_file_2d = None
+    debug_log_file_1d = None
+    debug_log_file_2d = None
+
     if ENABLE_LOGGING:
         if not os.path.exists(LOG_DIR):
             os.makedirs(LOG_DIR)
@@ -124,53 +165,60 @@ def viewer_process(queue):
         log_file_2d = os.path.join(LOG_DIR, "drift_log_2D.csv")
         log_file_1d = os.path.join(LOG_DIR, LOG_FILE_NAME_1D)
         log_file_2d = os.path.join(LOG_DIR, LOG_FILE_NAME_2D)
-
-    # Logik für den Flat Valley Schwellenwert anwenden
-    # -1 deaktiviert den Filter vollständig (Flat Valley niemals aktiv)
-    flat_valley_threshold = OPT_FLAT_VALLEY_THRESHOLD if ENABLE_FLAT_VALLEY_FILTER else -1.0
     
-    # Optimizer initialisieren (Nutzt die oben konfigurierten dynamischen Variablen)
+    if ENABLE_DEBUG_LOGGING:
+        if not os.path.exists(LOG_DIR):
+            os.makedirs(LOG_DIR)
+        debug_log_file_1d = os.path.join(LOG_DIR, DEBUG_LOG_FILE_1D)
+        debug_log_file_2d = os.path.join(LOG_DIR, DEBUG_LOG_FILE_2D)
+
+    # Initialize Optimizers
     optimizer_elbow = Optimizer1D(
         sensor_upper=ID_UPPER, 
         sensor_lower=ID_LOWER, 
         window_size=OPT_WINDOW_SIZE, 
         step_size=OPT_STEP_SIZE,
-        flat_valley_threshold=flat_valley_threshold,
+        flat_valley_threshold=OPT_FLAT_VALLEY_THRESHOLD,
         enable_singularity_filter=ENABLE_SINGULARITY_FILTER,
-        tau_delta_=TAU_DELTA,
+        enable_flat_valley_filter=ENABLE_FLAT_VALLEY_FILTER,
+        enable_anti_windup=ENABLE_ANTI_WINDUP,
         tau_b_=TAU_B,
-        log_file=log_file_1d
+        tau_delta_=TAU_DELTA,
+        delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
+        log_file=log_file_1d,
+        debug_log_file=debug_log_file_1d
     )
     
-    # NEU: 2D Optimizer für das Schultergelenk (minimiert axiale Drehung, erlaubt freie Bewegung auf 2 anderen Achsen)
     optimizer_shoulder = Optimizer2D_Universal(
         sensor_parent=ID_BASE, 
         sensor_child=ID_UPPER, 
         window_size=OPT_WINDOW_SIZE, 
         step_size=OPT_STEP_SIZE,
-        flat_valley_threshold=flat_valley_threshold,
+        flat_valley_threshold=OPT_FLAT_VALLEY_THRESHOLD,
         enable_singularity_filter=ENABLE_SINGULARITY_FILTER,
-        log_file=log_file_2d
+        enable_flat_valley_filter=ENABLE_FLAT_VALLEY_FILTER,
+        enable_anti_windup=ENABLE_ANTI_WINDUP,
+        enable_limrom=ENABLE_LIMROM_2D,
+        tau_b_= TAU_B,
+        tau_delta_=TAU_DELTA,
+        delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
+        log_file=log_file_2d,
+        debug_log_file=debug_log_file_2d
     )
     
     # --- MANUELLE SENSOR-TO-SEGMENT KALIBRIERUNG ---
-    # --- ALTE KONFIGURATION (Auskommentiert, funktionierend) ---
     # R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 0], degrees=True)
     # R_ALIGN_UPPER = R.from_euler('xyz', [-90, 0, 0], degrees=True)
     # R_ALIGN_LOWER = R.from_euler('xyz', [-90, 0, 180], degrees=True)
     # MIRROR_BASE  = [1, -1, -1] 
     # MIRROR_UPPER = [1, -1, -1]
     # MIRROR_LOWER = [-1, 1, -1]
-    
-    # --- NEUE, EFFIZIENTERE KONFIGURATION ---
-    import numpy as np
-    
+        
     R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 0], degrees=True)
     R_ALIGN_UPPER = R.from_euler('xyz', [-90, 0, 0], degrees=True)
     R_ALIGN_LOWER = R.from_euler('xyz', [-90, 0, 180], degrees=True)
     
-    # NumPy Arrays beschleunigen die Element-weise Multiplikation im Loop massiv.
-    # Format direkt für SciPy bereitgestellt: [X, Y, Z, W]
+    # [X, Y, Z, W]
     Q_MAP_BASE  = np.array([ 1, -1, -1, 1], dtype=np.float32) 
     Q_MAP_UPPER = np.array([ 1, -1, -1, 1], dtype=np.float32)
     Q_MAP_LOWER = np.array([-1,  1, -1, 1], dtype=np.float32)
@@ -182,16 +230,11 @@ def viewer_process(queue):
         while True:
             last_visual_packet = None
             
-            # --- 1. SCHNELLE VERARBEITUNG DER QUEUE ---
-            # Wir ziehen alle ungelesenen Pakete aus der Queue
-            # und füttern nur den Optimizer. Die Babylon-Visualisierung wird
-            # übersprungen, bis die Queue leer ist.
             try:
                 while True:
                     packet = queue.get_nowait()
                     packet_count += 1
                     
-                    # --- ALTE VERARBEITUNG (Auskommentiert) ---
                     # q_b = packet[ID_BASE].get('quat', [1, 0, 0, 0])  if ID_BASE  in packet else [1, 0, 0, 0]
                     # q_u = packet[ID_UPPER].get('quat', [1, 0, 0, 0]) if ID_UPPER in packet else [1, 0, 0, 0]
                     # q_l = packet[ID_LOWER].get('quat', [1, 0, 0, 0]) if ID_LOWER in packet else [1, 0, 0, 0]
@@ -199,14 +242,11 @@ def viewer_process(queue):
                     # r_up_raw   = R.from_quat([q_u[1]*MIRROR_UPPER[0], q_u[2]*MIRROR_UPPER[1], q_u[3]*MIRROR_UPPER[2], q_u[0]])
                     # r_low_raw  = R.from_quat([q_l[1]*MIRROR_LOWER[0], q_l[2]*MIRROR_LOWER[1], q_l[3]*MIRROR_LOWER[2], q_l[0]])
 
-                    # --- NEUE EFFIZIENTE VERARBEITUNG ---
-                    # Schnelleres Dictionary-Lookup ohne doppelte 'in' Überprüfung (spart CPU-Zyklen)
                     q_b = packet.get(ID_BASE, {}).get('quat', [1.0, 0.0, 0.0, 0.0])
                     q_u = packet.get(ID_UPPER, {}).get('quat', [1.0, 0.0, 0.0, 0.0])
                     q_l = packet.get(ID_LOWER, {}).get('quat', [1.0, 0.0, 0.0, 0.0])
                     
-                    # Vektorisierte NumPy-Multiplikation direkt im SciPy [x, y, z, w] Format.
-                    # SciPy akzeptiert das Array nativ (ohne nochmalige Konvertierung).
+                    # [x, y, z, w]
                     r_base_raw = R.from_quat(np.array([q_b[1], q_b[2], q_b[3], q_b[0]]) * Q_MAP_BASE)
                     r_up_raw   = R.from_quat(np.array([q_u[1], q_u[2], q_u[3], q_u[0]]) * Q_MAP_UPPER)
                     r_low_raw  = R.from_quat(np.array([q_l[1], q_l[2], q_l[3], q_l[0]]) * Q_MAP_LOWER)
@@ -218,12 +258,14 @@ def viewer_process(queue):
                     
                     # 3. Aligned-Daten bedingt in die Optimizer schieben
                     current_delta_yaw_elbow = 0.0
+                    angle_elbow_x = 0.0
                     if TRACKING_MODE in ['ALL', '1D']:
-                        current_delta_yaw_elbow = optimizer_elbow.add_packet_and_optimize(r_up_aligned, r_low_aligned)
+                        current_delta_yaw_elbow, angle_elbow_x = optimizer_elbow.add_packet_and_optimize(r_up_aligned, r_low_aligned)
                         
                     current_delta_yaw_shoulder = 0.0
+                    angles_shoulder = {'x': 0.0, 'y': 0.0}
                     if TRACKING_MODE in ['ALL', '2D']:
-                        current_delta_yaw_shoulder = optimizer_shoulder.add_packet_and_optimize(r_base_aligned, r_up_aligned)
+                        current_delta_yaw_shoulder, angles_shoulder = optimizer_shoulder.add_packet_and_optimize(r_base_aligned, r_up_aligned)
                     
                     # Speichere dir dieses letzte verarbeitete Element für den 3D Viewer!
                     last_visual_packet = {
@@ -231,7 +273,9 @@ def viewer_process(queue):
                         'r_up': r_up_aligned,
                         'r_low': r_low_aligned,
                         'dy_elbow': current_delta_yaw_elbow,
-                        'dy_sho': current_delta_yaw_shoulder
+                        'dy_sho': current_delta_yaw_shoulder,
+                        'angle_elbow_x': angle_elbow_x,
+                        'angles_shoulder': angles_shoulder
                     }
             except std_queue.Empty:
                 pass # Queue ist komplett abgearbeitet, wir können rendern!
@@ -242,7 +286,13 @@ def viewer_process(queue):
             if elapsed_fps >= 1.0:
                 hz = packet_count / elapsed_fps
                 if hz > 0: 
-                    print(f"[{time.strftime('%H:%M:%S')}] ⚙️ System läuft mit: {hz:.1f} Hz (Ziel: {SENSOR_HZ} Hz)")
+                    ang_info = ""
+                    if last_visual_packet:
+                        sx = last_visual_packet['angles_shoulder'].get('x', 0.0)
+                        sy = last_visual_packet['angles_shoulder'].get('y', 0.0)
+                        ex = last_visual_packet['angle_elbow_x']
+                        ang_info = f" | Schulter: {sx:.1f}°, {sy:.1f}° | Ellenbogen: {ex:.1f}°"
+                    print(f"[{time.strftime('%H:%M:%S')}] ⚙️ System läuft mit: {hz:.1f} Hz (Ziel: {SENSOR_HZ} Hz){ang_info}")
                 packet_count = 0
                 last_fps_time = current_time
                 
@@ -254,6 +304,8 @@ def viewer_process(queue):
                 r_low_aligned  = last_visual_packet['r_low']
                 current_delta_yaw_elbow = last_visual_packet['dy_elbow']
                 current_delta_yaw_shoulder = last_visual_packet['dy_sho']
+                angle_elbow_x = last_visual_packet['angle_elbow_x']
+                angles_shoulder = last_visual_packet['angles_shoulder']
                 
                 # 4. KINEMATIK: Offset auf die nachfolgenden Gelenke anwenden
                 r_offset_elbow = R.from_euler('z', current_delta_yaw_elbow, degrees=False)
@@ -279,10 +331,28 @@ def viewer_process(queue):
                 box0.update_from_data({'quaternion': q_base_send})
                 box1.update_from_data({'quaternion': q_joint_shoulder_send})
                 box2.update_from_data({'quaternion': q_joint_elbow_send})
+
+                # Winkel-Anzeige aktualisieren
+                shoulder_text = f"Shoulder: {angles_shoulder.get('x', 0.0):.1f}° (X), {angles_shoulder.get('y', 0.0):.1f}° (Y)"
+                elbow_text = f"Elbow: {angle_elbow_x:.1f}° (X)"
+                text_shoulder.update_from_data({
+                    'text': shoulder_text,
+                    'position': [0, 2.5, -2],
+                    'fontSize': 70,
+                    'color': '#FFFFFF'
+                })
+                text_elbow.update_from_data({
+                    'text': elbow_text,
+                    'position': [0, 1.5, -2],
+                    'fontSize': 70,
+                    'color': '#FFFFFF'
+                })
             
                 box0.update()
                 box1.update()
                 box2.update()
+                text_shoulder.update()
+                text_elbow.update()
             
             # Schont den Prozessor. Babylon JS (Browser) rendert typischerweise eh nur mit 60fps (ca. 0.016s)
             time.sleep(0.015)

@@ -2,6 +2,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 import time
 import threading
+from scipy.optimize import least_squares
 
 class Optimizer1D:
     """
@@ -12,7 +13,7 @@ class Optimizer1D:
     The optimizer collects data in a sliding window and searches for the heading correction angle (delta_yaw) 
     that minimizes the measured movement (variance) on these two "forbidden" axes.
     """
-    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, tau_b_=2.8, tau_delta_=0.7, log_file="drift_log_1D.csv"):
+    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_1D.csv", debug_log_file=None):
         """
         Initializes the 1D optimizer for a sensor pair.
         
@@ -23,6 +24,7 @@ class Optimizer1D:
             step_size (int): After how many new samples the calculation should be *repeated*.
                              If step_size = window_size, there is no overlap (tiles back-to-back).
             flat_valley_threshold: Threshold (variance) from which movement is sufficient for finding a minimum.
+            debug_log_file (str, optional): If provided, saves all tested heading offsets and their cost values for debugging.
         """
         self.s_upper = sensor_upper
         self.s_lower = sensor_lower
@@ -30,14 +32,21 @@ class Optimizer1D:
         self.step_size = step_size
         self.flat_valley_threshold = flat_valley_threshold
         self.enable_singularity_filter = enable_singularity_filter
+        self.enable_flat_valley_filter = enable_flat_valley_filter
+        self.enable_anti_windup = enable_anti_windup
+        self.delta_delta_weight = delta_delta_weight
         self.log_file = log_file
+        self.debug_log_file = debug_log_file
+        
+        self.latest_angle_x = 0.0
         
         if self.log_file:
-            import os
-            if not os.path.exists(self.log_file):
-                with open(self.log_file, "w") as f:
-                    f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val\n")
-                    f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x\n")
+            with open(self.log_file, "w") as f:
+                f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,k_b_w,k_delta_w\n")
+        
+        if self.debug_log_file:
+            with open(self.debug_log_file, "w") as f:
+                f.write("time,window_index,tested_yaw_deg,cost_val,is_best,movement_var_up,movement_var_low,is_flat_valley,r_w,best_yaw_deg\n")
         
         # Buffers for the sliding window
         self.buffer_upper = []
@@ -50,14 +59,14 @@ class Optimizer1D:
         self.current_heading_offset = 0.0
         
         # --- Heading Filter States (Paper Eq. 15-20) ---
-        self.w_index = 0
-        self.b_w_minus_1 = 0.0
-        self.delta_w_minus_1 = 0.0
-        self.delta_f_w_minus_1 = 0.0
-        self.T_s = step_size / 200.0  # Window duration in sec (Assumption: 100 Hz DataFrame)
+        self.w_index = 0 # window index (iterations)
+        self.b_w_minus_1 = 0.0 # old bias
+        self.delta_w_minus_1 = 0.0 # old heading offset (delta_w)
+        self.delta_f_w_minus_1 = 0.0 # old filtered heading offset (delta_f_w)
+        self.T_s = step_size / 200.0  # Window duration in sec 
         self.tau_b = tau_b_              # Tunable time constant for bias filter
         self.tau_delta = tau_delta_           # Tunable time constant for heading filter
-        self.r_min = 0.1              # Empirically tuned threshold for singularity detection
+        self.r_min = 0.1              # Singularity detection
 
     def add_packet_and_optimize(self, r_up_aligned, r_low_aligned):
         """
@@ -83,46 +92,10 @@ class Optimizer1D:
         # Always return the currently found
         # target directly (no visual faking/smoothing)
         self.current_heading_offset = self.target_heading_offset
-        return self.current_heading_offset
-    '''
-    def _cost_function(self, delta_yaw, r_upper_inv, r_lower_window):
-        # 1. Heading-Offset auf das untere Gelenk anwenden
-        rot_offset = R.from_euler('z', delta_yaw, degrees=False)
-        r_lower_corrected = rot_offset * r_lower_window
-        
-        # 2. Relative Orientierung zwischen Ober- und Unterarm berechnen
-        r_rel = r_upper_inv * r_lower_corrected
-        
-        # 3. Quaternionen extrahieren
-        q = r_rel.as_quat()
-        x, y, z, w = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
-        
-        # --- EULER WINKEL EXTRAKTION (vgl. Eq. 13 im Paper) ---
-        angle_y = np.arcsin(np.clip(2 * w * y - 2 * z * x, -1.0, 1.0))
-        angle_z = np.arcsin(np.clip(2 * w * z + 2 * x * y, -1.0, 1.0))
-        angle_x = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
-        
-        # --- DEINE SPEZIFISCHEN GELENKGRENZEN ---
-        upper_bound = np.deg2rad(98.0)
-        lower_bound = np.deg2rad(-28.0)
-        
-        # --- ROBUSTER LimRoM-PENALTY (Quadratische Parabel für SciPy) ---
-        # Diese quadratische Strafe sorgt dafür, dass der Optimizer den Gradienten 
-        # (die Steigung) spürt und nicht blind in der 180-Grad-Mehrdeutigkeit stecken bleibt.
-        penalty_over = np.sum(np.maximum(0, angle_x - upper_bound)**2)
-        penalty_under = np.sum(np.maximum(0, lower_bound - angle_x)**2)
-        
-        # Gewichtung der Strafe (1000.0 zwingt SciPy sehr strikt in den erlaubten Bereich)
-        limrom_penalty = (penalty_under + penalty_over) * 1000.0
-        
-        # --- GESAMTKOSTEN ---
-        # Wir minimieren die Bewegungen auf den "verbotenen" Achsen (Y und Z) 
-        # und addieren die Strafe, falls die X-Achse (Beugung) anatomisch unmöglich wird.
-        cost = np.sum(angle_y**2 + angle_z**2) + limrom_penalty
-        
-        return cost
-    '''
-    def _cost_function(self, delta_yaw, r_upper_inv, r_lower_window):
+        return self.current_heading_offset, self.latest_angle_x
+
+    def _residuals(self, delta_yaw_array, r_upper_inv, r_lower_window):
+        delta_yaw = delta_yaw_array[0]
         rot_offset = R.from_euler('z', delta_yaw, degrees=False)
         r_lower_corrected = rot_offset * r_lower_window
         r_rel = r_upper_inv * r_lower_corrected
@@ -141,16 +114,27 @@ class Optimizer1D:
         # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
         # Excludes mirrored or anatomically impossible orientations (the "second valley")
         # by strictly penalizing states outside valid joint bounds (cf. Eq. 14).
-        penalty_over = np.maximum(0, angle_x - upper_bound)
-        penalty_under = np.maximum(0, lower_bound - angle_x)
+        # least_squares quadriert automatisch. Für einen Faktor von 100 müssen wir hier * 10.0 nehmen.
+        penalty_over = np.maximum(0, angle_x - upper_bound) * 2.0
+        penalty_under = np.maximum(0, lower_bound - angle_x) * 2.0
         
-        # --- COST FUNCTION (cf. Eq. 17) ---
-        # Massive Gewichtung der anatomischen Grenzen, um den 180-Grad-Flip zu blockieren!
-        limrom_penalty = np.sum(penalty_over**2 + penalty_under**2) * 1000.0
+        res_list = [angle_y, angle_z, penalty_over, penalty_under]
+        if self.delta_delta_weight > 0.0:
+            regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
+            res_list.append([regularization_residual])
+            
+        residuals = np.concatenate(res_list)
         
-        cost = np.sum(angle_y**2 + angle_z**2) + limrom_penalty
+        # --- DEBUG LOGGING: Speichere jeden von least_squares getesteten Punkt ---
+        if self.debug_log_file and hasattr(self, '_current_debug_info'):
+            cost = np.sum(residuals**2)
+            info = self._current_debug_info
+            with open(self.debug_log_file, "a") as f:
+                # is_best ist temporär 0, da wir erst am Ende das echte Minimum loggen
+                f.write(f"{time.time()},{info['w_index']},{np.degrees(delta_yaw):.4f},{cost:.6f},0,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},0.0\n")
         
-        return cost
+        # Gibt das 1D-Array aller Restfehler zurück an SciPy
+        return residuals
 
     def _run_optimization_threaded(self, buf_up, buf_low):
         """
@@ -185,54 +169,63 @@ class Optimizer1D:
             
             opt_start = time.time()
             
+            # Logik: Soll die Optimierung übersprungen werden?
+            should_bypass_opt = is_flat_valley and self.enable_flat_valley_filter
+
             # --- STATIONARY PERIOD BYPASS ("FLAT VALLEY") ---
-            if is_flat_valley:
+            if should_bypass_opt:
                 # We skip the search entirely and freeze the old value update 
                 # (bias will still extrapolate) to protect the model from noise.
                 delta_w = self.delta_w_minus_1
                 opt_duration = time.time() - opt_start
                 optimization_success = True
                 cost_fun_val = 0.0  # For the logger
+                
+                # Write a single debug line for flat valley indicating no search occurred
+                if self.debug_log_file:
+                    with open(self.debug_log_file, "a") as f:
+                        f.write(f"{time.time()},{self.w_index + 1},{np.degrees(delta_w):.4f},{cost_fun_val:.6f},1,{movement_var_up:.6E},{movement_var_low:.6E},1,{r_w:.4f},{np.degrees(delta_w):.4f}\n")
             else:
-                # --- COARSE-TO-FINE GRID SEARCH ---
-                # Search using coarse steps
-                coarse_space = np.linspace(-np.pi, np.pi, 36)
-                best_coarse_cost = float('inf')
-                best_coarse_yaw = 0.0
+                # --- LEVENBERG-MARQUARDT (GAUSS-NEWTON) OPTIMIZATION ---
+                # Der perfekte Startpunkt aus dem vorherigen Fenster
+                initial_guess = [self.delta_f_w_minus_1]
                 
-                for yaw in coarse_space:
-                    cost = self._cost_function(yaw, r_upper_inv, r_lower)
-                    if cost < best_coarse_cost:
-                        best_coarse_cost = cost
-                        best_coarse_yaw = yaw
-                        
-                # Search fine grid around best coarse result
-                fine_radius = np.deg2rad(10.0)
-                fine_space = np.linspace(best_coarse_yaw - fine_radius, best_coarse_yaw + fine_radius, 20)
+                self._current_debug_info = {
+                    'w_index': self.w_index + 1,
+                    'var_up': movement_var_up,
+                    'var_low': movement_var_low,
+                    'is_flat': int(is_flat_valley),
+                    'r_w': r_w
+                }
                 
-                best_cost = best_coarse_cost
-                best_yaw = best_coarse_yaw
+                # --- COARSE SEARCH FOR PLOTTING ---
+                if self.debug_log_file:
+                    info = self._current_debug_info
+                    del self._current_debug_info
+                    for test_deg in range(-180, 180, 5):
+                        test_rad = np.deg2rad(test_deg)
+                        res_coarse = self._residuals([test_rad], r_upper_inv, r_lower)
+                        cost_coarse = np.sum(res_coarse**2)
+                        with open(self.debug_log_file, "a") as f:
+                            f.write(f"{time.time()},{info['w_index']},{test_deg:.4f},{cost_coarse:.6f},0,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},0.0\n")
+                    self._current_debug_info = info
                 
-                for yaw in fine_space:
-                    cost = self._cost_function(yaw, r_upper_inv, r_lower)
-                    if cost < best_cost:
-                        best_fine_cost = cost
-                        best_fine_yaw = yaw
-                        
-                # Search ultra-fine grid around best fine result
-                ultra_fine_radius = np.deg2rad(1.0)
-                ultra_fine_space = np.linspace(best_fine_yaw - ultra_fine_radius, best_fine_yaw + ultra_fine_radius, 21)
-                best_cost = best_fine_cost
-                best_yaw = best_fine_yaw
-
-                for yaw in ultra_fine_space:
-                    cost = self._cost_function(yaw, r_upper_inv, r_lower)
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_yaw = yaw
+                res = least_squares(
+                    self._residuals, 
+                    initial_guess, 
+                    args=(r_upper_inv, r_lower), 
+                    method='lm'
+                )
+                
+                best_yaw = res.x[0]
+                best_cost = res.cost * 2.0  # res.cost ist bei scipy immer 0.5 * sum(residuals**2)
+                
+                if self.debug_log_file:
+                    with open(self.debug_log_file, "a") as f:
+                        f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
                 
                 opt_duration = time.time() - opt_start
-                optimization_success = True 
+                optimization_success = res.success 
                 delta_w = best_yaw
                 cost_fun_val = best_cost
             
@@ -240,19 +233,36 @@ class Optimizer1D:
                 self.w_index += 1
                 w_idx = self.w_index
                 
+                # Retrieve the angle_x (Gelenkwinkel / joint angle) from the last buffer element
+                q_up = R.from_quat(buf_up[-1]).inv()
+                q_low_corrected = R.from_euler('z', delta_w, degrees=False) * R.from_quat(buf_low[-1])
+                q_rel = q_up * q_low_corrected
+                q = q_rel.as_quat()
+                # Extracted according to eq. 13 limits
+                angle_x = np.arctan2(2 * (q[3] * q[0] + q[1] * q[2]), 1 - 2 * (q[0]**2 + q[1]**2))
+                self.latest_angle_x = angle_x
+                
                 # --- FILTER GAINS ---
                 k_b_w = max(1.0 - np.exp(-np.log(2) * self.T_s / self.tau_b), 1.0 / w_idx)
                 k_delta_w = max(1.0 - np.exp(-np.log(2) * self.T_s / self.tau_delta), 1.0 / w_idx)
                 
                 # --- HEADING FILTER / BIAS EXTRAPOLATION ---
                 if self.enable_singularity_filter:
-                    is_singular = (r_w < self.r_min) or is_flat_valley
+                    # Ein Flat Valley Event zählt nur dann als singulär, wenn der Filter dafür auch aktiviert ist
+                    is_singular_due_to_flat_valley = is_flat_valley and self.enable_flat_valley_filter
+                    is_singular = (r_w < self.r_min) or is_singular_due_to_flat_valley
                     s_w = 0.0 if is_singular else r_w
                     
-                    if is_flat_valley:
+                    if is_singular_due_to_flat_valley:
                         print(f"💤 [1D] Flat Valley ACTIVE! Arm held still. Using bias extrapolation.")
                     elif is_singular:
                         print(f"⚠️ [1D] Singularity filter ACTIVE! (Rating (r_w): {r_w:.3f} < {self.r_min}). Using bias extrapolation.")
+##############################################################################
+                    # --- STATE OVERRIDE (ANTI WIND-UP) ---
+                    if is_singular and self.enable_anti_windup:
+                        # Verhindert, dass ein fehlerhafter Müllwert für den nächsten Frame gespeichert wird
+                        delta_w = self.delta_f_w_minus_1 + self.b_w_minus_1
+##############################################################################
                 else:
                     is_singular = False
                     s_w = 1.0 # Trust fully without dampening
@@ -276,6 +286,7 @@ class Optimizer1D:
                 q_best = (r_upper_inv * (rot_offset_best * r_lower)).as_quat()
                 x_b, y_b, z_b, w_b = q_best[:, 0], q_best[:, 1], q_best[:, 2], q_best[:, 3]
                 best_angle_x = np.arctan2(2 * (w_b * x_b + y_b * z_b), 1 - 2 * (x_b**2 + y_b**2))
+                self.latest_angle_x = np.degrees(np.mean(best_angle_x))
                 avg_angle_x_deg = np.degrees(np.mean(best_angle_x))
                 
                 print(f"[{time.strftime('%H:%M:%S')}] 1D Optimizer (Grid): Target offset = {np.degrees(self.current_heading_offset):.2f}° (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s; angle_x (Beugung): {avg_angle_x_deg:.1f}°)")
@@ -283,8 +294,7 @@ class Optimizer1D:
                 # Logging
                 if self.log_file:
                     with open(self.log_file, "a") as f:
-                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f}\n")
-                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angle_x_deg:.2f}\n")
+                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angle_x_deg:.2f},{k_b_w:.6f},{k_delta_w:.6f}\n")
                         
         except Exception as e:
             print(f"Error in optimizer thread: {e}")
@@ -299,21 +309,29 @@ class Optimizer2D_Universal:
     The optimizer searches for the heading correction angle (delta_yaw) that minimizes the variance 
     on this single "forbidden" axis.
     """
-    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, tau_b_=2.8, tau_delta_=0.7, log_file="drift_log_2D.csv"):
+    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_limrom=False, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_2D.csv", debug_log_file=None):
         self.s_parent = sensor_parent
         self.s_child = sensor_child
         self.window_size = window_size
         self.step_size = step_size
         self.flat_valley_threshold = flat_valley_threshold
         self.enable_singularity_filter = enable_singularity_filter
+        self.enable_flat_valley_filter = enable_flat_valley_filter
+        self.enable_anti_windup = enable_anti_windup
+        self.enable_limrom = enable_limrom
+        self.delta_delta_weight = delta_delta_weight
         self.log_file = log_file
+        self.debug_log_file = debug_log_file
+
+        self.latest_angles = {'x': 0.0, 'y': 0.0, 'z': 0.0}
 
         if self.log_file:
-            import os
-            if not os.path.exists(self.log_file):
-                with open(self.log_file, "w") as f:
-                    f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val\n")
-                    f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,angle_y,angle_z\n")
+            with open(self.log_file, "w") as f:
+                f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,angle_y,angle_z,k_b_w,k_delta_w\n")
+        
+        if self.debug_log_file:
+            with open(self.debug_log_file, "w") as f:
+                f.write("time,window_index,tested_yaw_deg,cost_val,is_best,movement_var_parent,movement_var_child,is_flat_valley,r_w,best_yaw_deg\n")
         
         self.buffer_parent = []
         self.buffer_child = []
@@ -351,9 +369,11 @@ class Optimizer2D_Universal:
             
         # Always return the currently found target directly (no visual faking/smoothing)
         self.current_heading_offset = self.target_heading_offset
-        return self.current_heading_offset
+        return self.current_heading_offset, self.latest_angles
 
-    def _cost_function(self, delta_yaw, r_parent_inv, r_child_window):
+    def _residuals(self, delta_yaw_array, r_parent_inv, r_child_window):
+        delta_yaw = delta_yaw_array[0]
+        
         # 1. Apply yaw offset
         rot_offset = R.from_euler('z', delta_yaw, degrees=False)
         r_child_corrected = rot_offset * r_child_window
@@ -378,9 +398,40 @@ class Optimizer2D_Universal:
         inner_term = np.clip(2 * w * z + 2 * x * y, -1.0, 1.0)
         beta_0_hat = np.arcsin(inner_term)
         
-        # COST: Minimize variance of the angle on the constrained axis
-        cost = np.var(beta_0_hat)
-        return cost
+        # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
+        angle_x = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
+        angle_y = np.arcsin(np.clip(2 * w * y - 2 * z * x, -1.0, 1.0))
+        
+        # Großzügige Limits, um die normalen Bewegungen der Schulter nicht zu stören, 
+        # aber die mathematischen "Phantom"-Minima (180° Twist) stark zu bestrafen.
+        y_upper_bound = np.deg2rad(60.0)
+        y_lower_bound = np.deg2rad(-40.0)
+        x_upper_bound = np.deg2rad(30.0)
+        x_lower_bound = np.deg2rad(-30.0)
+        
+        penalty_over_x = np.maximum(0, angle_x - x_upper_bound) #* 2.0
+        penalty_under_x = np.maximum(0, x_lower_bound - angle_x) #* 2.0
+        penalty_over_y = np.maximum(0, angle_y - y_upper_bound) #* 2.0
+        penalty_under_y = np.maximum(0, y_lower_bound - angle_y) #* 2.0
+        
+        res_list = [np.atleast_1d(beta_0_hat)]
+        if self.delta_delta_weight > 0.0:
+            regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
+            res_list.append([regularization_residual])
+            
+        if self.enable_limrom:
+            res_list.extend([penalty_over_x, penalty_under_x, penalty_over_y, penalty_under_y])
+            
+        residuals = np.concatenate(res_list)
+        
+        # --- DEBUG LOGGING: Speichere jeden von least_squares getesteten Punkt ---
+        if self.debug_log_file and hasattr(self, '_current_debug_info'):
+            cost = np.sum(residuals**2)
+            info = self._current_debug_info
+            with open(self.debug_log_file, "a") as f:
+                f.write(f"{time.time()},{info['w_index']},{np.degrees(delta_yaw):.4f},{cost:.6f},0,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},0.0\n")
+        
+        return residuals
 
     def _run_optimization_threaded(self, buf_par, buf_chi):
         self.is_calculating = True
@@ -412,51 +463,59 @@ class Optimizer2D_Universal:
             
             opt_start = time.time()
             
-            if is_flat_valley:
+            # Logik: Soll die Optimierung übersprungen werden?
+            should_bypass_opt = is_flat_valley and self.enable_flat_valley_filter
+            
+            if should_bypass_opt:
                 delta_w = self.delta_w_minus_1
                 opt_duration = time.time() - opt_start
                 optimization_success = True
                 cost_fun_val = 0.0
+                
+                # Write a single debug line for flat valley indicating no search occurred
+                if self.debug_log_file:
+                    with open(self.debug_log_file, "a") as f:
+                        f.write(f"{time.time()},{self.w_index + 1},{np.degrees(delta_w):.4f},{cost_fun_val:.6f},1,{movement_var_par:.6E},{movement_var_chi:.6E},1,{r_w:.4f},{np.degrees(delta_w):.4f}\n")
             else:
-                # --- 3-STAGE COARSE-TO-FINE GRID SEARCH ---
+                # --- LEVENBERG-MARQUARDT (GAUSS-NEWTON) OPTIMIZATION ---
+                initial_guess = [self.delta_f_w_minus_1]
                 
-                # 1. GROBE SUCHE (36 Punkte, 10° Auflösung)
-                coarse_space = np.linspace(-np.pi, np.pi, 36)
-                best_coarse_cost = float('inf')
-                best_coarse_yaw = 0.0
+                self._current_debug_info = {
+                    'w_index': self.w_index + 1,
+                    'var_up': movement_var_par,
+                    'var_low': movement_var_chi,
+                    'is_flat': int(is_flat_valley),
+                    'r_w': r_w
+                }
                 
-                for yaw in coarse_space:
-                    cost = self._cost_function(yaw, r_parent_inv, r_child)
-                    if cost < best_coarse_cost:
-                        best_coarse_cost = cost
-                        best_coarse_yaw = yaw
-                        
-                # 2. FEINE SUCHE (21 Punkte, 1° Auflösung im Radius von +/- 10° um den groben Treffer)
-                fine_radius = np.deg2rad(10.0)
-                fine_space = np.linspace(best_coarse_yaw - fine_radius, best_coarse_yaw + fine_radius, 21)
-                best_fine_cost = best_coarse_cost
-                best_fine_yaw = best_coarse_yaw
-                
-                for yaw in fine_space:
-                    cost = self._cost_function(yaw, r_parent_inv, r_child)
-                    if cost < best_fine_cost:
-                        best_fine_cost = cost
-                        best_fine_yaw = yaw
+                # --- COARSE SEARCH FOR PLOTTING ---
+                if self.debug_log_file:
+                    info = self._current_debug_info
+                    del self._current_debug_info
+                    for test_deg in range(-180, 180, 5):
+                        test_rad = np.deg2rad(test_deg)
+                        res_coarse = self._residuals([test_rad], r_parent_inv, r_child)
+                        cost_coarse = np.sum(res_coarse**2)
+                        with open(self.debug_log_file, "a") as f:
+                            f.write(f"{time.time()},{info['w_index']},{test_deg:.4f},{cost_coarse:.6f},0,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},0.0\n")
+                    self._current_debug_info = info
 
-                # 3. ULTRA-FEINE SUCHE (21 Punkte, 0.1° Auflösung im Radius von +/- 1° um den feinen Treffer)
-                ultra_fine_radius = np.deg2rad(1.0)
-                ultra_fine_space = np.linspace(best_fine_yaw - ultra_fine_radius, best_fine_yaw + ultra_fine_radius, 21)
-                best_cost = best_fine_cost
-                best_yaw = best_fine_yaw
-
-                for yaw in ultra_fine_space:
-                    cost = self._cost_function(yaw, r_parent_inv, r_child)
-                    if cost < best_cost:
-                        best_cost = cost
-                        best_yaw = yaw
+                res = least_squares(
+                    self._residuals, 
+                    initial_guess, 
+                    args=(r_parent_inv, r_child), 
+                    method='lm'
+                )
+                
+                best_yaw = res.x[0]
+                best_cost = res.cost * 2.0
+                
+                if self.debug_log_file:
+                    with open(self.debug_log_file, "a") as f:
+                        f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_par:.6E},{movement_var_chi:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
                 
                 opt_duration = time.time() - opt_start
-                optimization_success = True
+                optimization_success = res.success
                 delta_w = best_yaw
                 cost_fun_val = best_cost
             
@@ -466,12 +525,20 @@ class Optimizer2D_Universal:
                 
                 # --- HEADING FILTER / BIAS EXTRAPOLATION ---
                 if self.enable_singularity_filter:
-                    is_singular = (r_w < self.r_min) or is_flat_valley
+                    # Ein Flat Valley Event zählt nur dann als singulär, wenn der Filter dafür auch aktiviert ist
+                    is_singular_due_to_flat_valley = is_flat_valley and self.enable_flat_valley_filter
+                    is_singular = (r_w < self.r_min) or is_singular_due_to_flat_valley
                     s_w = 0.0 if is_singular else r_w
-                    if is_flat_valley:
+                    if is_singular_due_to_flat_valley:
                         print(f"💤 [2D] Flat Valley ACTIVE! Arm held still. Using bias extrapolation.")
                     elif is_singular:
                         print(f"⚠️ [2D] Singularity filter ACTIVE! (Rating (r_w): {r_w:.3f} < {self.r_min}). Using bias extrapolation.")
+##############################################################################                   
+                    # --- STATE OVERRIDE (ANTI WIND-UP) ---
+                    if is_singular and self.enable_anti_windup:
+                        # Verhindert, dass ein fehlerhafter Müllwert für den nächsten Frame gespeichert wird
+                        delta_w = self.delta_f_w_minus_1 + self.b_w_minus_1
+##############################################################################
                 else:
                     is_singular = False
                     s_w = 1.0
@@ -490,18 +557,51 @@ class Optimizer2D_Universal:
                 
                 self.target_heading_offset = delta_f_w
                 self.current_heading_offset = self.target_heading_offset
-                print(f"[{time.strftime('%H:%M:%S')}] 2D Optimizer (Shoulder): Target offset = {np.degrees(self.current_heading_offset):.2f}° (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s)")
                 
                 # Berechne die finalen Euler-Winkel (Schulter) der gefundenen "besten" Lösung
-                rot_offset_best = R.from_euler('z', delta_w, degrees=False)
+                rot_offset_best = R.from_euler('z', delta_f_w, degrees=False)
                 r_rel_best = r_parent_inv * (rot_offset_best * r_child)
                 avg_angles = np.mean(r_rel_best.as_euler('XYZ', degrees=True), axis=0)
-                
+
+                #self.latest_angles['x'] = avg_angles[0]
+                #self.latest_angles['y'] = avg_angles[1]
+                #self.latest_angles['z'] = avg_angles[2]
+                quats = r_rel_best.as_quat()
+
+                x = quats[:, 0]
+                y = quats[:, 1]
+                z = quats[:, 2]
+                w = quats[:, 3]
+
+                # 2. Manuelle Berechnung der Euler-Winkel (in Radiant)
+                # X-Achse (oft als Roll bezeichnet)
+                angle_x_rad = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
+
+                # Y-Achse (oft als Pitch bezeichnet)
+                # np.clip schützt davor, dass float-Ungenauigkeiten (z.B. 1.0000001) den Arkussinus abstürzen lassen
+                angle_y_rad = np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0))
+
+                # Z-Achse (oft als Yaw bezeichnet)
+                angle_z_rad = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))
+
+                # 3. Umwandlung von Radiant in Grad
+                angle_x_deg = np.rad2deg(angle_x_rad)
+                angle_y_deg = np.rad2deg(angle_y_rad)
+                angle_z_deg = np.rad2deg(angle_z_rad)
+
+                # 4. Mittelwert über das gesamte Fenster bilden (wie in deinem Original-Code)
+                self.latest_angles['x'] = np.mean(angle_x_deg)
+                self.latest_angles['y'] = np.mean(angle_y_deg)
+                self.latest_angles['z'] = np.mean(angle_z_deg)
+
+                print(f"[{time.strftime('%H:%M:%S')}] 2D Optimizer (Shoulder): Target offset = {np.degrees(self.current_heading_offset):.2f}°")
+                print(f"    -> Gelenkwinkel / Angles (X/Y/Z) of the best solution: {self.latest_angles['x']:.1f}°, {self.latest_angles['y']:.1f}°, {self.latest_angles['z']:.1f}°")    
+                print(f"    -> (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s)")
+
                 # Logging
                 if self.log_file:
                     with open(self.log_file, "a") as f:
-                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f}\n")
-                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angles[0]:.2f},{avg_angles[1]:.2f},{avg_angles[2]:.2f}\n")
+                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angles[0]:.2f},{avg_angles[1]:.2f},{avg_angles[2]:.2f},{k_b_w:.6f},{k_delta_w:.6f}\n")
             else:
                 print("⚠️ 2D optimization failed for this window.")
         except Exception as e:
