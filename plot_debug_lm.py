@@ -48,21 +48,55 @@ def main():
         fig.suptitle(f"Cost Landscape Detail - Window {args.window}", fontsize=14, fontweight='bold')
         
         if not is_flat:
-            # We don't want lines bouncing around between stages, so just scatter the points
-            ax.scatter(window_data['tested_yaw_deg'], window_data['cost_val'], 
+            # Nur reguläre Testpunkte (is_best == 0) für die Kurve plotten!
+            tested_pts = window_data[window_data['is_best'] == 0]
+            ax.scatter(tested_pts['tested_yaw_deg'], tested_pts['cost_val'], 
                        s=30, color='tab:blue', alpha=0.6, label='Tested Points')
             
-            # Find the absolute best point in this window
-            best_idx = window_data['cost_val'].idxmin()
-            best_pt = window_data.loc[best_idx]
+            # Globales Minimum
+            best_pts = window_data[window_data['is_best'] == 1]
+            if len(best_pts) > 0:
+                best_pt = best_pts.iloc[0]
+                ax.scatter(best_pt['tested_yaw_deg'], best_pt['cost_val'], 
+                          color='red', s=250, marker='*', edgecolors='darkred', linewidths=2, 
+                          label='Selected Minimum', zorder=11)
+            else:
+                # Fallback, falls kein is_best=1 da ist
+                best_idx = window_data['cost_val'].idxmin()
+                best_pt = window_data.loc[best_idx]
+                ax.scatter(best_pt['tested_yaw_deg'], best_pt['cost_val'], 
+                          color='red', s=250, marker='*', edgecolors='darkred', linewidths=2, 
+                          label='Global Minimum', zorder=11)
             
-            ax.scatter(best_pt['tested_yaw_deg'], best_pt['cost_val'], 
-                      color='red', s=200, marker='*', edgecolors='darkred', linewidths=2, 
-                      label='Global Minimum', zorder=10)
+            # Seed A (is_best == 3)
+            seed_a = window_data[window_data['is_best'] == 3]
+            if len(seed_a) > 0:
+                for _, s_pt in seed_a.iterrows():
+                    yaw = s_pt['tested_yaw_deg']
+                    cost = s_pt['cost_val']
+                    lr_cost = s_pt['best_yaw_deg'] # LimRom Kosten in letzter Spalte
+                    ax.scatter(yaw, cost, color='gold', s=150, marker='v', edgecolor='black', linewidth=1, label='Seed A (History)', zorder=10)
+                    ax.annotate(f"LimRom: {lr_cost:.1f}", (yaw, cost), xytext=(0, 15), textcoords='offset points', ha='center', fontsize=9, fontweight='bold', color='darkgoldenrod')
+                    
+            # Seed B (is_best == 4)
+            seed_b = window_data[window_data['is_best'] == 4]
+            if len(seed_b) > 0:
+                for _, s_pt in seed_b.iterrows():
+                    yaw = s_pt['tested_yaw_deg']
+                    cost = s_pt['cost_val']
+                    lr_cost = s_pt['best_yaw_deg'] # LimRom Kosten in letzter Spalte
+                    ax.scatter(yaw, cost, color='orange', s=150, marker='^', edgecolor='black', linewidth=1, label='Seed B (Mirrored)', zorder=10)
+                    ax.annotate(f"LimRom: {lr_cost:.1f}", (yaw, cost), xytext=(0, 15), textcoords='offset points', ha='center', fontsize=9, fontweight='bold', color='orangered')
                 
             ax.set_xlabel("Tested Yaw Offset [Grad]", fontweight='bold')
             ax.set_ylabel("Cost Value", fontweight='bold')
             ax.grid(True, alpha=0.5)
+            
+            # Dynamisches Y-Limit um extreme Ausreißer (Singularitäten) wegzuschneiden
+            if len(tested_pts) > 0:
+                p90 = np.percentile(tested_pts['cost_val'], 90)
+                max_y = max(p90 * 1.5, 5.0)
+                ax.set_ylim(bottom=-max_y*0.05, top=max_y)
             
             # Add text box with window stats
             r_w_val = best_pt['r_w']
@@ -71,7 +105,10 @@ def main():
             ax.text(0.05, 0.95, info_text, transform=ax.transAxes, fontsize=10,
                     verticalalignment='top', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
                     
-            ax.legend(loc="upper right")
+            # Wir entfernen Duplicate Labels in Legende
+            handles, labels = ax.get_legend_handles_labels()
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), loc="upper right")
         else:
             ax.text(0.5, 0.5, "FLAT VALLEY\n(Optimierung übersprungen)", 
                     horizontalalignment='center', verticalalignment='center',
@@ -103,13 +140,18 @@ def main():
             ax.scatter(window_data['tested_yaw_deg'], window_data['cost_val'], 
                    s=15, alpha=0.6, label=f"Window {int(window_idx)}")
     
-    # Markiere die besten Punkte
-    # Group by window to find the absolute minimum for each
-    best_points = df.loc[df.groupby('window_index')['cost_val'].idxmin()]
+    # Markiere die Minima (Dual-Seed)
+    best_points = df[df['is_best'] == 1]
+    alt_points = df[df['is_best'] == 2]
+    
     if len(best_points) > 0:
         ax.scatter(best_points['tested_yaw_deg'], best_points['cost_val'], 
                   color='red', s=100, marker='*', edgecolors='darkred', linewidths=2, 
-                  label='Best Found', zorder=10)
+                  label='Selected Minimum', zorder=10)
+    if len(alt_points) > 0:
+        ax.scatter(alt_points['tested_yaw_deg'], alt_points['cost_val'], 
+                  color='blue', s=100, marker='*', edgecolors='darkblue', linewidths=2, 
+                  label='Alternative Minimum', zorder=9)
     
     ax.set_ylabel("Cost Value", fontweight='bold')
     ax.grid(True, alpha=0.3)
@@ -121,11 +163,15 @@ def main():
     scatter = ax.scatter(df['time'], df['tested_yaw_deg'], c=df['cost_val'], 
                         cmap='RdYlGn_r', s=30, alpha=0.6, edgecolors='black', linewidth=0.5)
     
-    # Markiere beste Punkte extra
+    # Markiere beste und alternative Punkte
     if len(best_points) > 0:
         ax.scatter(best_points['time'], best_points['tested_yaw_deg'], 
                   color='red', s=100, marker='*', edgecolors='darkred', linewidths=2, 
-                  label='Best Found', zorder=10)
+                  label='Selected Minimum', zorder=10)
+    if len(alt_points) > 0:
+        ax.scatter(alt_points['time'], alt_points['tested_yaw_deg'], 
+                  color='blue', s=100, marker='*', edgecolors='darkblue', linewidths=2, 
+                  label='Alternative Minimum', zorder=9)
     
     ax.plot(df['time'], df['best_yaw_deg'], 'b-', linewidth=2, alpha=0.7, label='Current Best Yaw')
     ax.set_ylabel("Tested Yaw [°]", fontweight='bold')

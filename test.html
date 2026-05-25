@@ -94,26 +94,91 @@
             box2.material = mat2;
 
             // --- LOCAL COORDINATE SYSTEMS ON SENSORS ---
-            // Helper function to attach fixed RGB axis lines to an object
-            // Ensures axes rotate exactly as the boxes (Red=X, Green=Y, Blue=Z)
-            function createLocalAxes(parentMesh, length) {
-                var axisX = BABYLON.MeshBuilder.CreateLines("axisX", {points: [BABYLON.Vector3.Zero(), new BABYLON.Vector3(length, 0, 0)]}, scene);
-                axisX.color = new BABYLON.Color3(1, 0, 0);
-                axisX.parent = parentMesh;
+            // Hilfsfunktion für schwebende Text-Labels (immer zur Kamera gedreht)
+            function addTextPlane(text, color, parent, position) {
+                var dynamicTexture = new BABYLON.DynamicTexture("dt", {width: 512, height: 128}, scene);
+                dynamicTexture.hasAlpha = true;
+                dynamicTexture.drawText(text, 10, 80, "bold 44px Arial", color, "transparent", true);
                 
-                var axisY = BABYLON.MeshBuilder.CreateLines("axisY", {points: [BABYLON.Vector3.Zero(), new BABYLON.Vector3(0, length, 0)]}, scene);
-                axisY.color = new BABYLON.Color3(0, 1, 0);
-                axisY.parent = parentMesh;
+                var plane = BABYLON.MeshBuilder.CreatePlane("plane", {width: 2.0, height: 0.5}, scene);
+                var mat = new BABYLON.StandardMaterial("mat", scene);
+                mat.diffuseTexture = dynamicTexture;
+                mat.emissiveColor = new BABYLON.Color3(1, 1, 1);
+                mat.backFaceCulling = false;
+                plane.material = mat;
                 
-                var axisZ = BABYLON.MeshBuilder.CreateLines("axisZ", {points: [BABYLON.Vector3.Zero(), new BABYLON.Vector3(0, 0, length)]}, scene);
-                axisZ.color = new BABYLON.Color3(0, 0, 1);
-                axisZ.parent = parentMesh;
+                plane.parent = parent;
+                plane.position = position;
+                plane.billboardMode = BABYLON.Mesh.BILLBOARDMODE_ALL; // Rotiert immer zur Kamera!
+            }
+
+            // --- 0-DEGREE GHOST REFERENCE MODELS ---
+            const ghostMat = new BABYLON.StandardMaterial("ghostMat", scene);
+            ghostMat.diffuseColor = new BABYLON.Color3(1, 1, 1);
+            ghostMat.alpha = 0.3;
+            ghostMat.wireframe = true;
+            
+            // Ghost Upper Arm (0 Grad Referenz zur Schulter)
+            const ghostUpperArm = BABYLON.MeshBuilder.CreateBox("ghostUpperArm", {width: 1.1, height: 0.4, depth: 1.7}, scene);
+            ghostUpperArm.parent = box0; // An die Basis (Torso) gebunden
+            ghostUpperArm.position.x = 0.8; // joint1 pos.x
+            ghostUpperArm.position.z = 0.975; // box1 pos.z
+            ghostUpperArm.material = ghostMat;
+            addTextPlane("0° Reference", "#ffffff", ghostUpperArm, new BABYLON.Vector3(0, 0.5, 0));
+
+            // Ghost Forearm (0 Grad Referenz zum Ellbogen)
+            const ghostJoint2 = new BABYLON.TransformNode("ghostJoint2", scene);
+            ghostJoint2.parent = joint1; // An den Oberarm gebunden
+            ghostJoint2.position.z = 1.95; // joint2 pos.z
+            const ghostForearm = BABYLON.MeshBuilder.CreateBox("ghostForearm", {width: 0.9, height: 0.35, depth: 1.5}, scene);
+            ghostForearm.parent = ghostJoint2;
+            ghostForearm.position.z = 0.85; // box2 pos.z
+            ghostForearm.material = ghostMat;
+            addTextPlane("0° Reference", "#ffffff", ghostForearm, new BABYLON.Vector3(0, 0.5, 0));
+
+            // Generiert schöne 3D-Pfeile mit Label an der Spitze
+            function createArrowAxis(name, parentMesh, color, direction, length, labelText) {
+                var mat = new BABYLON.StandardMaterial(name + "_mat", scene);
+                mat.diffuseColor = color;
+                mat.emissiveColor = color;
+                
+                var stem = BABYLON.MeshBuilder.CreateTube(name + "_stem", {
+                    path: [BABYLON.Vector3.Zero(), direction.scale(length)], 
+                    radius: 0.04
+                }, scene);
+                stem.material = mat;
+                stem.parent = parentMesh;
+                
+                var tip = BABYLON.MeshBuilder.CreateCylinder(name + "_tip", {
+                    height: 0.3, 
+                    diameterTop: 0, 
+                    diameterBottom: 0.15
+                }, scene);
+                tip.material = mat;
+                tip.parent = parentMesh;
+                tip.position = direction.scale(length);
+                
+                if (direction.x > 0) { tip.rotation.z = -Math.PI / 2; }
+                else if (direction.z > 0) { tip.rotation.x = Math.PI / 2; }
+                
+                if (labelText) {
+                    addTextPlane(labelText, color.toHexString(), parentMesh, direction.scale(length + 0.4));
+                }
+            }
+
+            function createLocalAxes(parentMesh, length, descriptor) {
+                // Rot = X-Achse (Flexion/Extension)
+                createArrowAxis(descriptor + "_X", parentMesh, new BABYLON.Color3(1, 0.2, 0.2), new BABYLON.Vector3(1, 0, 0), length, "X (Flexion)");
+                // Grün = Y-Achse (Abduktion/Adduktion)
+                createArrowAxis(descriptor + "_Y", parentMesh, new BABYLON.Color3(0.2, 1, 0.2), new BABYLON.Vector3(0, 1, 0), length, "Y (Abduktion)");
+                // Blau = Z-Achse (Vorwärtsrichtung / 0 Grad Ruhestellung / Twist)
+                createArrowAxis(descriptor + "_Z", parentMesh, new BABYLON.Color3(0.2, 0.5, 1), new BABYLON.Vector3(0, 0, 1), length, "Z (0° / Vorne)");
             }
 
             // Achsen an unsere Gelenke/Segmente anheften (Länge: 2 Einheiten)
-            createLocalAxes(box0, 2);
-            createLocalAxes(joint1, 2); // <-- Sitzt jetzt perfekt im Gelenk!
-            createLocalAxes(joint2, 2); // <-- Sitzt jetzt perfekt im Gelenk!
+            createLocalAxes(box0, 2.5, "Torso");
+            createLocalAxes(joint1, 2.0, "Shoulder"); // <-- Sitzt jetzt perfekt im Gelenk!
+            createLocalAxes(joint2, 1.5, "Elbow");    // <-- Sitzt jetzt perfekt im Gelenk!
 
             const socket = new WebSocket('ws://localhost:9000');
             

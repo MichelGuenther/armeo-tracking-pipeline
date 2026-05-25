@@ -13,7 +13,7 @@ class Optimizer1D:
     The optimizer collects data in a sliding window and searches for the heading correction angle (delta_yaw) 
     that minimizes the measured movement (variance) on these two "forbidden" axes.
     """
-    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_1D.csv", debug_log_file=None):
+    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_valley_retry_validation=True, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, limrom_mode="off", mode_pure_constraint_referee=False, log_file="drift_log_1D.csv", debug_log_file=None):
         """
         Initializes the 1D optimizer for a sensor pair.
         
@@ -34,6 +34,12 @@ class Optimizer1D:
         self.enable_singularity_filter = enable_singularity_filter
         self.enable_flat_valley_filter = enable_flat_valley_filter
         self.enable_anti_windup = enable_anti_windup
+        self.mode_pure_constraint_referee = mode_pure_constraint_referee
+        self.limrom_mode = limrom_mode
+        if self.limrom_mode == "dual_seed_referee":
+            self.mode_pure_constraint_referee = True
+            
+        self.rom_violation_counter = 0  # Hysteresis Counter
         self.delta_delta_weight = delta_delta_weight
         self.log_file = log_file
         self.debug_log_file = debug_log_file
@@ -42,7 +48,7 @@ class Optimizer1D:
         
         if self.log_file:
             with open(self.log_file, "w") as f:
-                f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,k_b_w,k_delta_w\n")
+                f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,k_b_w,k_delta_w,valley_jump_occurred,seed_lost_occurred\n")
         
         if self.debug_log_file:
             with open(self.debug_log_file, "w") as f:
@@ -63,6 +69,7 @@ class Optimizer1D:
         self.b_w_minus_1 = 0.0 # old bias
         self.delta_w_minus_1 = 0.0 # old heading offset (delta_w)
         self.delta_f_w_minus_1 = 0.0 # old filtered heading offset (delta_f_w)
+        self.seed_B_w_minus_1 = np.pi # old alternative seed for 2D tracking
         self.T_s = step_size / 200.0  # Window duration in sec 
         self.tau_b = tau_b_              # Tunable time constant for bias filter
         self.tau_delta = tau_delta_           # Tunable time constant for heading filter
@@ -94,6 +101,17 @@ class Optimizer1D:
         self.current_heading_offset = self.target_heading_offset
         return self.current_heading_offset, self.latest_angle_x
 
+    def _eval_limrom_cost(self, delta_yaw, r_upper_inv, r_lower_window):
+        orig_limrom = self.limrom_mode
+        self.limrom_mode = "classic"
+        orig_weight = self.delta_delta_weight
+        self.delta_delta_weight = 0.0
+        res = self._residuals([delta_yaw], r_upper_inv, r_lower_window)
+        cost = np.sum(res**2)
+        self.limrom_mode = orig_limrom
+        self.delta_delta_weight = orig_weight
+        return cost
+
     def _residuals(self, delta_yaw_array, r_upper_inv, r_lower_window):
         delta_yaw = delta_yaw_array[0]
         rot_offset = R.from_euler('z', delta_yaw, degrees=False)
@@ -112,13 +130,14 @@ class Optimizer1D:
         lower_bound = np.deg2rad(-60.0)
         
         # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
-        # Excludes mirrored or anatomically impossible orientations (the "second valley")
-        # by strictly penalizing states outside valid joint bounds (cf. Eq. 14).
         # least_squares quadriert automatisch. Für einen Faktor von 100 müssen wir hier * 10.0 nehmen.
         penalty_over = np.maximum(0, angle_x - upper_bound) * 2.0
         penalty_under = np.maximum(0, lower_bound - angle_x) * 2.0
         
-        res_list = [angle_y, angle_z, penalty_over, penalty_under]
+        res_list = [angle_y, angle_z]
+        if getattr(self, 'limrom_mode', 'off') == "classic" or getattr(self, 'enable_limrom', False):
+            res_list.extend([penalty_over, penalty_under])
+            
         if self.delta_delta_weight > 0.0:
             regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
             res_list.append([regularization_residual])
@@ -208,26 +227,132 @@ class Optimizer1D:
                         cost_coarse = np.sum(res_coarse**2)
                         with open(self.debug_log_file, "a") as f:
                             f.write(f"{time.time()},{info['w_index']},{test_deg:.4f},{cost_coarse:.6f},0,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},0.0\n")
+                    
+                    # LOGGE DIE START SEEDS FÜR DAS PLOTTEN!
+                    seed_a = self.delta_f_w_minus_1
+                    # Korrekte Verschiebung um 180° (pi) und Wrapping in [-pi, pi]:
+                    seed_b = (seed_a + np.pi + np.pi) % (2 * np.pi) - np.pi
+                    
+                    cost_a_seed = np.sum(self._residuals([seed_a], r_upper_inv, r_lower)**2)
+                    cost_b_seed = np.sum(self._residuals([seed_b], r_upper_inv, r_lower)**2)
+                    
+                    # LimRom Evaluation
+                    lr_cost_a = self._eval_limrom_cost(seed_a, r_upper_inv, r_lower)
+                    lr_cost_b = self._eval_limrom_cost(seed_b, r_upper_inv, r_lower)
+                    
+                    with open(self.debug_log_file, "a") as f:
+                        f.write(f"{time.time()},{info['w_index']},{np.degrees(seed_a):.4f},{cost_a_seed:.6f},3,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},{lr_cost_a:.6f}\n")
+                        f.write(f"{time.time()},{info['w_index']},{np.degrees(seed_b):.4f},{cost_b_seed:.6f},4,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},{lr_cost_b:.6f}\n")
                     self._current_debug_info = info
                 
-                res = least_squares(
-                    self._residuals, 
-                    initial_guess, 
-                    args=(r_upper_inv, r_lower), 
-                    method='lm'
-                )
+                self.latest_jump_event = False
+                self.latest_seed_lost = False
                 
-                best_yaw = res.x[0]
-                best_cost = res.cost * 2.0  # res.cost ist bei scipy immer 0.5 * sum(residuals**2)
-                
-                if self.debug_log_file:
-                    with open(self.debug_log_file, "a") as f:
-                        f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
-                
-                opt_duration = time.time() - opt_start
-                optimization_success = res.success 
-                delta_w = best_yaw
-                cost_fun_val = best_cost
+                if self.mode_pure_constraint_referee:
+                    # --- PURE CONSTRAINT REFEREE (DUAL SEED) ---
+                    seed_A = self.delta_f_w_minus_1
+                    seed_B = self.delta_f_w_minus_1 + np.pi
+                    seed_B = (seed_B + np.pi) % (2 * np.pi) - np.pi
+                    
+                    res_A = least_squares(self._residuals, [seed_A], args=(r_upper_inv, r_lower), method='lm')
+                    res_B = least_squares(self._residuals, [seed_B], args=(r_upper_inv, r_lower), method='lm')
+                    
+                    sol_A = res_A.x[0]
+                    sol_B = res_B.x[0]
+                    sol_A_norm = (sol_A + np.pi) % (2 * np.pi) - np.pi
+                    sol_B_norm = (sol_B + np.pi) % (2 * np.pi) - np.pi
+                    
+                    # Coarse Fallback
+                    dist_to_A = np.abs((sol_B_norm - sol_A_norm + np.pi) % (2 * np.pi) - np.pi)
+                    if dist_to_A < np.deg2rad(60.0):
+                        print(f"⚠️ [1D] Täler verschmolzen (Distanz {np.degrees(dist_to_A):.1f}°)! Starte Grid-Scan für Ausweich-Tal...")
+                        self.latest_seed_lost = True
+                        best_coarse_cost = float('inf')
+                        best_coarse_yaw = sol_B_norm
+                        for test_deg in range(-180, 180, 30):
+                            test_rad = np.deg2rad(test_deg)
+                            dist_to_A_test = np.abs((test_rad - sol_A_norm + np.pi) % (2 * np.pi) - np.pi)
+                            if dist_to_A_test > np.deg2rad(60.0):
+                                cost_coarse = np.sum(self._residuals([test_rad], r_upper_inv, r_lower)**2)
+                                if cost_coarse < best_coarse_cost:
+                                    best_coarse_cost = cost_coarse
+                                    best_coarse_yaw = test_rad
+                        res_C = least_squares(self._residuals, [best_coarse_yaw], args=(r_upper_inv, r_lower), method='lm')
+                        sol_B = res_C.x[0]
+                        sol_B_norm = (sol_B + np.pi) % (2 * np.pi) - np.pi
+                        res_B = res_C
+                        
+                        # Coarse Grid Logging
+                        if self.debug_log_file:
+                            for test_deg in range(-180, 180, 5):
+                                test_rad = np.deg2rad(test_deg)
+                                cost_coarse = np.sum(self._residuals([test_rad], r_upper_inv, r_lower)**2)
+                                with open(self.debug_log_file, "a") as f:
+                                    f.write(f"{time.time()},{self.w_index + 1},{test_deg:.4f},{cost_coarse:.6f},0,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(sol_A_norm):.4f}\n")
+                                    
+                    # Referee Costs
+                    orig_limrom = self.limrom_mode
+                    orig_weight = self.delta_delta_weight
+                    self.limrom_mode = "off"
+                    self.delta_delta_weight = 0.0
+                    cost_L_A = self._eval_limrom_cost(sol_A_norm, r_upper_inv, r_lower)
+                    cost_L_B = self._eval_limrom_cost(sol_B_norm, r_upper_inv, r_lower)
+                    self.limrom_mode = orig_limrom
+                    self.delta_delta_weight = orig_weight
+                    
+                    is_A_legal = (cost_L_A < 5.0) and (np.sum(res_A.fun**2) < 5.0)
+                    is_B_legal = (cost_L_B < 5.0) and (np.sum(res_B.fun**2) < 5.0)
+                    
+                    if is_A_legal and not is_B_legal:
+                        delta_yaw = sol_A_norm
+                        cost_fun_val = np.sum(res_A.fun**2)
+                    elif is_B_legal and not is_A_legal:
+                        delta_yaw = sol_B_norm
+                        cost_fun_val = np.sum(res_B.fun**2)
+                    else:
+                        # Tie-Breaker
+                        dist_A = np.abs((sol_A_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
+                        dist_B = np.abs((sol_B_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
+                        if dist_A <= dist_B:
+                            delta_yaw = sol_A_norm
+                            cost_fun_val = np.sum(res_A.fun**2)
+                        else:
+                            delta_yaw = sol_B_norm
+                            cost_fun_val = np.sum(res_B.fun**2)
+                            
+                    # Debug Logging for chosen Minima
+                    if self.debug_log_file:
+                        cost_A = np.sum(res_A.fun**2)
+                        cost_B = np.sum(res_B.fun**2)
+                        is_A_best = 1 if delta_yaw == sol_A_norm else 2
+                        is_B_best = 1 if delta_yaw == sol_B_norm else 2
+                        with open(self.debug_log_file, "a") as f:
+                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(sol_A_norm):.4f},{cost_A:.6f},{is_A_best},{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(delta_yaw):.4f}\n")
+                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(sol_B_norm):.4f},{cost_B:.6f},{is_B_best},{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(delta_yaw):.4f}\n")
+                            
+                    delta_w = delta_yaw
+                    optimization_success = True
+                    opt_duration = time.time() - opt_start
+                else:
+                    # --- LEVENBERG-MARQUARDT (STANDARD) ---
+                    res = least_squares(
+                        self._residuals, 
+                        initial_guess, 
+                        args=(r_upper_inv, r_lower), 
+                        method='lm'
+                    )
+                    
+                    best_yaw = res.x[0]
+                    best_cost = res.cost * 2.0  # res.cost ist bei scipy immer 0.5 * sum(residuals**2)
+                    
+                    if self.debug_log_file:
+                        with open(self.debug_log_file, "a") as f:
+                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
+                    
+                    opt_duration = time.time() - opt_start
+                    optimization_success = res.success 
+                    delta_w = best_yaw
+                    cost_fun_val = best_cost
             
             if optimization_success:
                 self.w_index += 1
@@ -267,6 +392,17 @@ class Optimizer1D:
                     is_singular = False
                     s_w = 1.0 # Trust fully without dampening
                 
+                # --- JUMP OVERRIDE FÜR DEN FILTER ---
+                if self.mode_pure_constraint_referee:
+                    jump_diff = (delta_w - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
+                    if np.abs(jump_diff) > np.deg2rad(120.0):
+                        # Es fand ein Valley Jump statt!
+                        jump_offset = jump_diff
+                        self.delta_w_minus_1 += jump_offset
+                        self.delta_f_w_minus_1 += jump_offset
+                        self.latest_jump_event = True
+                        print(f"🦘 [1D] Valley Jump detektiert! Filter-Historie um exakt {np.degrees(jump_offset):.1f}° verschoben.")
+                        
                 # Update bias (learned yaw drift rate)
                 b_w = self.b_w_minus_1 + s_w * k_b_w * (delta_w - self.delta_w_minus_1 - self.b_w_minus_1)
                 
@@ -289,12 +425,14 @@ class Optimizer1D:
                 self.latest_angle_x = np.degrees(np.mean(best_angle_x))
                 avg_angle_x_deg = np.degrees(np.mean(best_angle_x))
                 
-                print(f"[{time.strftime('%H:%M:%S')}] 1D Optimizer (Grid): Target offset = {np.degrees(self.current_heading_offset):.2f}° (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s; angle_x (Beugung): {avg_angle_x_deg:.1f}°)")
+                print(f"[{time.strftime('%H:%M:%S')}] 1D Optimizer (Elbow): Target offset = {np.degrees(self.current_heading_offset):.2f}°")
+                print(f"    \033[1;42m-> GELENKWINKEL 1D (Flexion/Extension): {self.latest_angle_x:.1f}° \033[0m")
+                print(f"    -> (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s)")
                 
                 # Logging
                 if self.log_file:
                     with open(self.log_file, "a") as f:
-                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angle_x_deg:.2f},{k_b_w:.6f},{k_delta_w:.6f}\n")
+                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{self.latest_angle_x:.2f},{k_b_w:.6f},{k_delta_w:.6f},{int(self.latest_jump_event)},{int(self.latest_seed_lost)}\n")
                         
         except Exception as e:
             print(f"Error in optimizer thread: {e}")
@@ -309,7 +447,7 @@ class Optimizer2D_Universal:
     The optimizer searches for the heading correction angle (delta_yaw) that minimizes the variance 
     on this single "forbidden" axis.
     """
-    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_limrom=False, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_2D.csv", debug_log_file=None):
+    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_valley_retry_validation=True, enable_limrom=False, limrom_mode="off", mode_pure_constraint_referee=False, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_2D.csv", debug_log_file=None):
         self.s_parent = sensor_parent
         self.s_child = sensor_child
         self.window_size = window_size
@@ -323,11 +461,18 @@ class Optimizer2D_Universal:
         self.log_file = log_file
         self.debug_log_file = debug_log_file
 
+        self.limrom_mode = limrom_mode
+        self.mode_pure_constraint_referee = False
+        if self.limrom_mode == "dual_seed_referee":
+            self.mode_pure_constraint_referee = True
+            
         self.latest_angles = {'x': 0.0, 'y': 0.0, 'z': 0.0}
+        self.latest_jump_event = False
+        self.latest_seed_lost = False
 
         if self.log_file:
             with open(self.log_file, "w") as f:
-                f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,angle_y,angle_z,k_b_w,k_delta_w\n")
+                f.write("time,window_index,r_w,is_singular,delta_w,b_w,delta_f_w,cost_val,opt_duration,angle_x,angle_y,angle_z,k_b_w,k_delta_w,valley_jump_occurred,seed_lost_occurred\n")
         
         if self.debug_log_file:
             with open(self.debug_log_file, "w") as f:
@@ -345,6 +490,7 @@ class Optimizer2D_Universal:
         self.b_w_minus_1 = 0.0
         self.delta_w_minus_1 = 0.0
         self.delta_f_w_minus_1 = 0.0
+        self.seed_B_w_minus_1 = np.pi
         self.T_s = step_size / 200.0  # Window duration in sec (Assumption: 100 Hz DataFrame)
         self.tau_b = tau_b_             # Tunable time constant for bias filter
         self.tau_delta = tau_delta_          # Tunable time constant for heading filter
@@ -370,6 +516,17 @@ class Optimizer2D_Universal:
         # Always return the currently found target directly (no visual faking/smoothing)
         self.current_heading_offset = self.target_heading_offset
         return self.current_heading_offset, self.latest_angles
+
+    def _eval_limrom_cost(self, delta_yaw, r_parent_inv, r_child_window):
+        orig_limrom = self.limrom_mode
+        self.limrom_mode = "classic"
+        orig_weight = self.delta_delta_weight
+        self.delta_delta_weight = 0.0
+        res = self._residuals([delta_yaw], r_parent_inv, r_child_window)
+        cost = np.sum(res**2)
+        self.limrom_mode = orig_limrom
+        self.delta_delta_weight = orig_weight
+        return cost
 
     def _residuals(self, delta_yaw_array, r_parent_inv, r_child_window):
         delta_yaw = delta_yaw_array[0]
@@ -398,29 +555,59 @@ class Optimizer2D_Universal:
         inner_term = np.clip(2 * w * z + 2 * x * y, -1.0, 1.0)
         beta_0_hat = np.arcsin(inner_term)
         
-        # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
+        # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) - CLASSIC MODE ---
         angle_x = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
         angle_y = np.arcsin(np.clip(2 * w * y - 2 * z * x, -1.0, 1.0))
         
-        # Großzügige Limits, um die normalen Bewegungen der Schulter nicht zu stören, 
-        # aber die mathematischen "Phantom"-Minima (180° Twist) stark zu bestrafen.
-        y_upper_bound = np.deg2rad(60.0)
-        y_lower_bound = np.deg2rad(-40.0)
         x_upper_bound = np.deg2rad(30.0)
         x_lower_bound = np.deg2rad(-30.0)
+        y_upper_bound = np.deg2rad(60.0)
+        y_lower_bound = np.deg2rad(-40.0)
         
-        penalty_over_x = np.maximum(0, angle_x - x_upper_bound) #* 2.0
-        penalty_under_x = np.maximum(0, x_lower_bound - angle_x) #* 2.0
-        penalty_over_y = np.maximum(0, angle_y - y_upper_bound) #* 2.0
-        penalty_under_y = np.maximum(0, y_lower_bound - angle_y) #* 2.0
+        penalty_over_x = np.maximum(0, angle_x - x_upper_bound)
+        penalty_under_x = np.maximum(0, x_lower_bound - angle_x)
+        penalty_over_y = np.maximum(0, angle_y - y_upper_bound)
+        penalty_under_y = np.maximum(0, y_lower_bound - angle_y)
         
         res_list = [np.atleast_1d(beta_0_hat)]
+        
+        if self.limrom_mode == "classic" or self.enable_limrom:
+            res_list.extend([penalty_over_x, penalty_under_x, penalty_over_y, penalty_under_y])
+        elif self.limrom_mode == "euclidean":
+            # Euklidische "Cone" Limits: Wir projizieren den Arm-Vektor in das Parent-System.
+            # Da die Twist-Rotation um Z berechnet wird, MUSS die Längsachse des Arms die Z-Achse sein!
+            v_parent = r_rel.apply([0.0, 0.0, 1.0])
+            
+            # Bei Z als Längsachse gilt:
+            # - Auslenkung in X (v_x) entspricht der Abduktion (Euler Y)
+            # - Auslenkung in Y (v_y) entspricht der Flexion (Euler X)
+            v_x = v_parent[:, 0]
+            v_y = v_parent[:, 1]
+            
+            # Die Limits werden vom Winkel in euklidische Distanzen umgerechnet
+            lim_x_pos = np.sin(np.deg2rad(60.0))   # Abduktion pos
+            lim_x_neg = np.sin(np.deg2rad(-40.0))  # Abduktion neg
+            lim_y_pos = np.sin(np.deg2rad(30.0))   # Flexion pos
+            lim_y_neg = np.sin(np.deg2rad(-30.0))  # Flexion neg
+            
+            # Weiche "Soft-Limits" (quadratisch statt hart eckig), damit der Solver nicht stolpert!
+            pen_x_pos = np.maximum(0, v_x - lim_x_pos)**2 * 10.0
+            pen_x_neg = np.maximum(0, lim_x_neg - v_x)**2 * 10.0
+            pen_y_pos = np.maximum(0, v_y - lim_y_pos)**2 * 10.0
+            pen_y_neg = np.maximum(0, lim_y_neg - v_y)**2 * 10.0
+            
+            res_list.extend([pen_x_pos, pen_x_neg, pen_y_pos, pen_y_neg])
+        elif self.limrom_mode == "paper":
+            if (angle_x > x_upper_bound).any(): res_list.append(np.array([10.0]))
+            elif (angle_x < x_lower_bound).any(): res_list.append(np.array([10.0]))
+            if (angle_y > y_upper_bound).any(): res_list.append(np.array([10.0]))
+            elif (angle_y < y_lower_bound).any(): res_list.append(np.array([10.0]))
+        elif self.limrom_mode == "exp":
+            res_list.extend([np.exp(penalty_over_x)-1, np.exp(penalty_under_x)-1, np.exp(penalty_over_y)-1, np.exp(penalty_under_y)-1])
+            
         if self.delta_delta_weight > 0.0:
             regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
             res_list.append([regularization_residual])
-            
-        if self.enable_limrom:
-            res_list.extend([penalty_over_x, penalty_under_x, penalty_over_y, penalty_under_y])
             
         residuals = np.concatenate(res_list)
         
@@ -492,30 +679,114 @@ class Optimizer2D_Universal:
                 if self.debug_log_file:
                     info = self._current_debug_info
                     del self._current_debug_info
+                    
+                    seed_a = self.delta_f_w_minus_1
+                    seed_b = self.seed_B_w_minus_1
+                    
                     for test_deg in range(-180, 180, 5):
                         test_rad = np.deg2rad(test_deg)
                         res_coarse = self._residuals([test_rad], r_parent_inv, r_child)
                         cost_coarse = np.sum(res_coarse**2)
                         with open(self.debug_log_file, "a") as f:
                             f.write(f"{time.time()},{info['w_index']},{test_deg:.4f},{cost_coarse:.6f},0,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},0.0\n")
+                    
+                    cost_a_seed = np.sum(self._residuals([seed_a], r_parent_inv, r_child)**2)
+                    cost_b_seed = np.sum(self._residuals([seed_b], r_parent_inv, r_child)**2)
+                    
+                    # LimRom Evaluation
+                    lr_cost_a = self._eval_limrom_cost(seed_a, r_parent_inv, r_child)
+                    lr_cost_b = self._eval_limrom_cost(seed_b, r_parent_inv, r_child)
+                    
+                    with open(self.debug_log_file, "a") as f:
+                        f.write(f"{time.time()},{info['w_index']},{np.degrees(seed_a):.4f},{cost_a_seed:.6f},3,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},{lr_cost_a:.6f}\n")
+                        f.write(f"{time.time()},{info['w_index']},{np.degrees(seed_b):.4f},{cost_b_seed:.6f},4,{info['var_up']:.6E},{info['var_low']:.6E},{info['is_flat']},{info['r_w']:.4f},{lr_cost_b:.6f}\n")
                     self._current_debug_info = info
 
-                res = least_squares(
-                    self._residuals, 
-                    initial_guess, 
-                    args=(r_parent_inv, r_child), 
-                    method='lm'
-                )
+                self.latest_jump_event = False
+                self.latest_seed_lost = False
                 
-                best_yaw = res.x[0]
-                best_cost = res.cost * 2.0
+                if self.mode_pure_constraint_referee:
+                    # --- PURE CONSTRAINT REFEREE (DUAL SEED 2D TRACKING) ---
+                    seed_A = self.delta_f_w_minus_1
+                    res_A = least_squares(self._residuals, [seed_A], args=(r_parent_inv, r_child), method='lm')
+                    sol_A_norm = (res_A.x[0] + np.pi) % (2 * np.pi) - np.pi
+                    
+                    # Tracked Seed B laden
+                    seed_B = self.seed_B_w_minus_1
+                    res_B = least_squares(self._residuals, [seed_B], args=(r_parent_inv, r_child), method='lm')
+                    sol_B_norm = (res_B.x[0] + np.pi) % (2 * np.pi) - np.pi
+                    
+                    # Kollisions-Prüfung: Wenn Seed B ins selbe Tal wie A gerutscht ist
+                    dist_A_B = np.abs((sol_B_norm - sol_A_norm + np.pi) % (2 * np.pi) - np.pi)
+                    if dist_A_B < np.deg2rad(90.0):
+                        print(f"⚠️ [2D] Täler verschmolzen (Distanz {np.degrees(dist_A_B):.1f}°)! Starte Grid-Scan für Ausweich-Tal...")
+                        best_coarse_cost = float('inf')
+                        # Wir suchen einen neuen Seed B weit weg von A
+                        for test_deg in range(-180, 180, 15):
+                            test_rad = np.deg2rad(test_deg)
+                            dist_to_A = np.abs((test_rad - sol_A_norm + np.pi) % (2 * np.pi) - np.pi)
+                            if dist_to_A > np.deg2rad(90.0):
+                                cost_coarse = np.sum(self._residuals([test_rad], r_parent_inv, r_child)**2)
+                                if cost_coarse < best_coarse_cost:
+                                    best_coarse_cost = cost_coarse
+                                    seed_B = test_rad
+                                    
+                        # Neu-Optimierung mit dem gefundenen, sicheren Seed B
+                        res_B = least_squares(self._residuals, [seed_B], args=(r_parent_inv, r_child), method='lm')
+                        sol_B_norm = (res_B.x[0] + np.pi) % (2 * np.pi) - np.pi
+                        
+                    # State für den B-Tracker im nächsten Frame updaten
+                    self.seed_B_w_minus_1 = sol_B_norm
+                    
+                    # Referee Costs
+                    orig_limrom = self.limrom_mode
+                    orig_weight = self.delta_delta_weight
+                    self.limrom_mode = "off"
+                    self.delta_delta_weight = 0.0
+                    cost_L_A = self._eval_limrom_cost(sol_A_norm, r_parent_inv, r_child)
+                    cost_L_B = self._eval_limrom_cost(sol_B_norm, r_parent_inv, r_child)
+                    self.limrom_mode = orig_limrom
+                    self.delta_delta_weight = orig_weight
+                    
+                    is_A_legal = (cost_L_A < 5.0) and (np.sum(res_A.fun**2) < 5.0)
+                    is_B_legal = (cost_L_B < 5.0) and (np.sum(res_B.fun**2) < 5.0)
+                    
+                    if is_A_legal and not is_B_legal:
+                        best_yaw = sol_A_norm
+                        best_cost = np.sum(res_A.fun**2)
+                    elif is_B_legal and not is_A_legal:
+                        best_yaw = sol_B_norm
+                        best_cost = np.sum(res_B.fun**2)
+                        self.latest_jump_event = True
+                    else:
+                        # Tie-Breaker Proximity
+                        dist_A = np.abs((sol_A_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
+                        dist_B = np.abs((sol_B_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
+                        if dist_A <= dist_B:
+                            best_yaw = sol_A_norm
+                            best_cost = np.sum(res_A.fun**2)
+                        else:
+                            best_yaw = sol_B_norm
+                            best_cost = np.sum(res_B.fun**2)
+                            self.latest_jump_event = True
+                            
+                    optimization_success = res_A.success or res_B.success
+                else:
+                    res = least_squares(
+                        self._residuals, 
+                        initial_guess, 
+                        args=(r_parent_inv, r_child), 
+                        method='lm'
+                    )
+                    best_yaw = res.x[0]
+                    best_cost = res.cost * 2.0
+                    optimization_success = res.success
                 
                 if self.debug_log_file:
                     with open(self.debug_log_file, "a") as f:
                         f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_par:.6E},{movement_var_chi:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
                 
                 opt_duration = time.time() - opt_start
-                optimization_success = res.success
                 delta_w = best_yaw
                 cost_fun_val = best_cost
             
@@ -601,7 +872,7 @@ class Optimizer2D_Universal:
                 # Logging
                 if self.log_file:
                     with open(self.log_file, "a") as f:
-                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{avg_angles[0]:.2f},{avg_angles[1]:.2f},{avg_angles[2]:.2f},{k_b_w:.6f},{k_delta_w:.6f}\n")
+                        f.write(f"{time.time()},{w_idx},{r_w:.4f},{int(is_singular)},{np.degrees(delta_w):.4f},{np.degrees(b_w):.4f},{np.degrees(delta_f_w):.4f},{cost_fun_val:.6f},{opt_duration:.4f},{self.latest_angles['x']:.2f},{self.latest_angles['y']:.2f},{self.latest_angles['z']:.2f},{k_b_w:.6f},{k_delta_w:.6f},{int(self.latest_jump_event)},{int(self.latest_seed_lost)}\n")
             else:
                 print("⚠️ 2D optimization failed for this window.")
         except Exception as e:

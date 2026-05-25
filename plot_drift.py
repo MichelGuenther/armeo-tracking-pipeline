@@ -52,6 +52,26 @@ def main():
     def mark_flat_valleys(ax):
         for st in df.loc[flat_valley_mask, 'time']:
             ax.axvline(st, color='red', alpha=0.08, linewidth=1)
+            
+    def mark_jumps(ax):
+        if 'valley_jump_occurred' in df.columns:
+            jump_mask = df['valley_jump_occurred'] == 1
+            first_jump = True
+            for idx, row in df[jump_mask].iterrows():
+                st = row['time']
+                w_idx = int(row['window_index']) if 'window_index' in row else ""
+                ax.axvline(st, color='black', alpha=0.8, linewidth=2, linestyle='--', label="Valley Jump" if first_jump else "")
+                # Schreibe Window Index daneben
+                ax.text(st, ax.get_ylim()[0] + (ax.get_ylim()[1] - ax.get_ylim()[0]) * 0.05, f" w:{w_idx}", color='black', fontsize=8, rotation=90, verticalalignment='bottom')
+                first_jump = False
+
+    def mark_seed_lost(ax):
+        if 'seed_lost_occurred' in df.columns:
+            lost_mask = df['seed_lost_occurred'] == 1
+            first_lost = True
+            for st in df.loc[lost_mask, 'time']:
+                ax.axvline(st, color='orange', alpha=0.9, linewidth=2, linestyle=':', label="Seed Lost (Grid Fallback)" if first_lost else "")
+                first_lost = False
 
     # 1. Heading Offsets (Raw + Bias + Filtered)
     axs[0].plot(df['time'], df['delta_w'], label=r"Roh-Messung Target ($\Delta_w$)", color='lightgray', linestyle='--')
@@ -61,10 +81,33 @@ def main():
     
     # Flat Valley / Singularität markieren
     mark_flat_valleys(axs[0])
+    mark_jumps(axs[0])
+    mark_seed_lost(axs[0])
     
     axs[0].set_ylabel("Heading [Grad]")
     axs[0].grid(True)
     axs[0].legend(loc="upper left")
+
+    # --- NEU: Window-Number Achse ---
+    if 'window_index' in df.columns:
+        ax2 = axs[0].twiny()
+        ax2.set_xlim(df['time'].min(), df['time'].max())
+        
+        w_max = df['window_index'].max()
+        tick_step = 50 if w_max <= 300 else (100 if w_max <= 1000 else 200)
+        w_ticks = np.arange(0, w_max + 1, tick_step)
+        
+        t_ticks = []
+        w_ticks_valid = []
+        for w in w_ticks:
+            idx = (df['window_index'] - w).abs().idxmin()
+            t_ticks.append(df.loc[idx, 'time'])
+            w_ticks_valid.append(df.loc[idx, 'window_index'])
+            
+        ax2.set_xticks(t_ticks)
+        ax2.set_xticklabels([str(int(w)) for w in w_ticks_valid])
+        ax2.set_xlabel("Window Number (w_index)", fontweight='bold', color='tab:gray')
+        ax2.tick_params(axis='x', colors='tab:gray')
 
     # 2. Window Rating r_w
     axs[1].plot(df['time'], df['r_w'], label=r"Window Rating ($r_w$)", color='tab:green')
@@ -154,7 +197,10 @@ def main():
         axs[5].plot(df['time'], df['angle_z'], label="Angle Z (Rotation)", color='tab:red')
     axs[5].set_ylabel("Angles [Grad]")
     mark_flat_valleys(axs[5])
+    mark_jumps(axs[5])
+    mark_seed_lost(axs[5])
     axs[5].grid(True)
+    axs[5].legend(loc="upper left")
 
     # --- NEU: Konvergenz berechnen und Min/Max markieren ---
     # Konvergenz: Wir prüfen, wann der gleitende Durchschnitt (10 Fenster) 

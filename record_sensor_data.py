@@ -23,7 +23,7 @@ SENSOR_HZ = 200
 
 # Zieldatei
 LOG_DIR = "logs"
-OUTPUT_FILE = os.path.join(LOG_DIR, "raw_sensor_recording_long.csv")
+OUTPUT_FILE = os.path.join(LOG_DIR, "raw_sensor_recording_only2Dhorizontal.csv")
 
 # ==============================================================================
 

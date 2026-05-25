@@ -59,22 +59,36 @@ ENABLE_SINGULARITY_FILTER = True
 # Anti-Windup filter
 ENABLE_ANTI_WINDUP = True
 
-# LimRoM for 2D Optimizer
-ENABLE_LIMROM_2D = False
+# LimRoM Mode for 2D Optimizer
+# Verfügbare Modi für 2D:
+#   "off"                : Pures Paper-Constraint (beta_0_hat = 0), keine anatomischen Strafen.
+#   "classic"            : Paper-Constraint + Lineare Strafe (Rechteck-Box) an den ROM-Grenzen.
+#   "euclidean"          : Paper-Constraint + Euklidische Ellipse-Cone Strafe aus der Literatur.
+#   "paper"              : Paper-Constraint + Diskreter 1-Punkt Strafwert bei ROM-Überschreitung.
+#   "exp"                : Paper-Constraint + Exponentiell wachsende Strafe bei ROM-Überschreitung.
+#   "pure_limrom_rad"    : Analysezweck: Ignoriert Twist, optimiert nur ROM-Box (Lineare Strafe in Rad).
+#   "pure_limrom_paper"  : Analysezweck: Ignoriert Twist, optimiert nur ROM-Box (1 Strafpunkt pro Überschreitung).
+#   "pure_limrom_exp"    : Analysezweck: Ignoriert Twist, optimiert nur ROM-Box (Exponentielle Strafe).
+#   "dual_seed_referee"  : Experimentell: Dual-Seed Suche (pures Twist-Constraint), gefiltert durch LimRoM.
+LIMROM_MODE_1D = "dual_seed_referee"
+LIMROM_MODE_2D = "dual_seed_referee"
+
+# Valley Jump Retry Validation (set to False to disable ROM checks during retries - for debugging)
+ENABLE_VALLEY_RETRY_VALIDATION = False
 
 TAU_B = 30
 TAU_DELTA = 1
 print(f"Optimierungsparameter: tau_b={TAU_B}, tau_delta={TAU_DELTA}")
-print(f"Filter-Einstellungen: Singularity={ENABLE_SINGULARITY_FILTER}, FlatValley={ENABLE_FLAT_VALLEY_FILTER}, AntiWindup={ENABLE_ANTI_WINDUP}, LimRom2D={ENABLE_LIMROM_2D}")
+print(f"Filter-Einstellungen: Singularity={ENABLE_SINGULARITY_FILTER}, FlatValley={ENABLE_FLAT_VALLEY_FILTER}, AntiWindup={ENABLE_ANTI_WINDUP}, LimRomMode_1D={LIMROM_MODE_1D}, LimRomMode_2D={LIMROM_MODE_2D}, ValleyRetryValidation={ENABLE_VALLEY_RETRY_VALIDATION}")
 
 # Cost function weight for difference in delta
-OPT_DELTA_DELTA_WEIGHT = 0 #OPT_WINDOW_SIZE / math.pi
+OPT_DELTA_DELTA_WEIGHT = 0 # OPT_WINDOW_SIZE / math.pi
 
 # --- LOGGING CONFIGURATION ---
-ENABLE_LOGGING = False
-ENABLE_DEBUG_LOGGING = False
+ENABLE_LOGGING = True
+ENABLE_DEBUG_LOGGING = True
 LOG_DIR = "logs/csv"
-SESSION_NAME = "session_32_tau_b30_tau_delta1_windup_nodeltadelta" # Wird in den Dateinamen der Logs eingebaut
+SESSION_NAME = "session_81_dual1D2D" # Wird in den Dateinamen der Logs eingebaut
 LOG_FILE_NAME_1D = f"{SESSION_NAME}_1D.csv" # 1D Overall
 LOG_FILE_NAME_2D = f"{SESSION_NAME}_2D.csv"  # 2D Overall
 DEBUG_LOG_FILE_1D = f"{SESSION_NAME}_debug_1D.csv"  # 1D Debug Log
@@ -185,6 +199,9 @@ def viewer_process(queue):
         tau_b_=TAU_B,
         tau_delta_=TAU_DELTA,
         delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
+        limrom_mode=LIMROM_MODE_1D,
+        enable_valley_retry_validation=ENABLE_VALLEY_RETRY_VALIDATION,
+        mode_pure_constraint_referee=(LIMROM_MODE_1D == "dual_seed_referee"),
         log_file=log_file_1d,
         debug_log_file=debug_log_file_1d
     )
@@ -198,10 +215,12 @@ def viewer_process(queue):
         enable_singularity_filter=ENABLE_SINGULARITY_FILTER,
         enable_flat_valley_filter=ENABLE_FLAT_VALLEY_FILTER,
         enable_anti_windup=ENABLE_ANTI_WINDUP,
-        enable_limrom=ENABLE_LIMROM_2D,
-        tau_b_= TAU_B,
+        limrom_mode=LIMROM_MODE_2D,
+        tau_b_=TAU_B,
         tau_delta_=TAU_DELTA,
         delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
+        enable_valley_retry_validation=ENABLE_VALLEY_RETRY_VALIDATION,
+        mode_pure_constraint_referee=(LIMROM_MODE_2D == "dual_seed_referee"),
         log_file=log_file_2d,
         debug_log_file=debug_log_file_2d
     )
@@ -365,6 +384,15 @@ def viewer_process(queue):
 
 # --- 3. DER BLUETOOTH-PROZESS (Hauptprozess) ---
 async def main():
+    # Unterdrücke die lästigen "crc mismatch" Fehler aus der capture2go Bibliothek in der Konsole
+    loop = asyncio.get_running_loop()
+    def custom_exception_handler(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, RuntimeError) and "crc mismatch" in str(exc):
+            return  # Ignoriere CRC-Fehler stillschweigend (passieren oft bei Start/Stopp oder kurzzeitigem Signalverlust)
+        loop.default_exception_handler(context)
+    loop.set_exception_handler(custom_exception_handler)
+
     data_queue = Queue()
     
     # 1. Den Viewer-Prozess im Hintergrund starten

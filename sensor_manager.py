@@ -283,18 +283,24 @@ class SensorManager:
             missing = [name for name in names if devices[name] is None]
             raise RuntimeError(f"Nicht alle Geräte gefunden: {missing}")
         
-        print("🧹 Führe präventives, globales Aufräumen (Disconnect) für ALLE gefundenen Sensoren aus...", flush=True)
+        print("🧹 Führe präventiven Bluetooth-Reset durch (Simuliere fehlgeschlagenen Versuch 1)...", flush=True)
         for idx, imu in enumerate(deviceList, 1):
             try:
-                print(f"   [{idx}/{len(deviceList)}] Trenne alte Verbindung (falls vorhanden) zu {imu.name}...", flush=True)
+                print(f"   [{idx}/{len(deviceList)}] Dummy-Connect zu {imu.name} um Device aufzuwecken...", flush=True)
+                await asyncio.wait_for(imu.connect(), timeout=5.0)
+            except Exception:
+                pass
+                
+            try:
+                print(f"   [{idx}/{len(deviceList)}] Aktives Trennen (Disconnect) von {imu.name}...", flush=True)
                 await asyncio.wait_for(imu.disconnect(), timeout=3.0)
             except Exception:
                 pass
         
-        print("   Warte 2 Sekunden, damit der Bluetooth-Stack zur Ruhe kommt...", flush=True)
-        await asyncio.sleep(2.0)
+        print("   Warte 3 Sekunden, damit der Bluetooth-Stack diese Resets verarbeiten kann...", flush=True)
+        await asyncio.sleep(3.0)
         
-        print(f"🔗 Verbinde {len(deviceList)} Sensoren sequentiell...")
+        print(f"🔗 Verbinde {len(deviceList)} Sensoren sequentiell RICHTIG...")
         for idx, imu in enumerate(deviceList, 1):
             try:
                 print(f"   [{idx}/{len(deviceList)}] Verbinde {imu.name}...", flush=True)
