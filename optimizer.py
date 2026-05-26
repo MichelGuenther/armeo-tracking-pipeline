@@ -208,6 +208,24 @@ class Optimizer1D:
                 # --- LEVENBERG-MARQUARDT (GAUSS-NEWTON) OPTIMIZATION ---
                 # Der perfekte Startpunkt aus dem vorherigen Fenster
                 initial_guess = [self.delta_f_w_minus_1]
+                if not self.mode_pure_constraint_referee and self.w_index == 0:
+                    best_cost_init = float('inf')
+                    for test_deg in range(-180, 180, 15):
+                        test_rad = np.deg2rad(test_deg)
+                        cost_init = np.sum(self._residuals([test_rad], r_parent_inv, r_child)**2)
+                        if cost_init < best_cost_init:
+                            best_cost_init = cost_init
+                            initial_guess = [test_rad]
+                    print(f"🌍 [2D] Initial Grid Search abgeschlossen. Starte bei {np.degrees(initial_guess[0]):.1f}°")
+                if not self.mode_pure_constraint_referee and self.w_index == 0:
+                    best_cost_init = float('inf')
+                    for test_deg in range(-180, 180, 15):
+                        test_rad = np.deg2rad(test_deg)
+                        cost_init = np.sum(self._residuals([test_rad], r_upper_inv, r_lower)**2)
+                        if cost_init < best_cost_init:
+                            best_cost_init = cost_init
+                            initial_guess = [test_rad]
+                    print(f"🌍 [1D] Initial Grid Search abgeschlossen. Starte bei {np.degrees(initial_guess[0]):.1f}°")
                 
                 self._current_debug_info = {
                     'w_index': self.w_index + 1,
@@ -303,22 +321,28 @@ class Optimizer1D:
                     is_A_legal = (cost_L_A < 5.0) and (np.sum(res_A.fun**2) < 5.0)
                     is_B_legal = (cost_L_B < 5.0) and (np.sum(res_B.fun**2) < 5.0)
                     
-                    if is_A_legal and not is_B_legal:
+                    # Wenn beide legal sind, priorisiere immer Seed A (verhindert unnötiges Springen)
+                    # Hysterese: Seed B muss 3x in Folge allein legal sein, um zu gewinnen
+                    if is_A_legal:
+                        self.rom_violation_counter = max(0, self.rom_violation_counter - 1)
                         delta_yaw = sol_A_norm
                         cost_fun_val = np.sum(res_A.fun**2)
                     elif is_B_legal and not is_A_legal:
-                        delta_yaw = sol_B_norm
-                        cost_fun_val = np.sum(res_B.fun**2)
-                    else:
-                        # Tie-Breaker
-                        dist_A = np.abs((sol_A_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
-                        dist_B = np.abs((sol_B_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
-                        if dist_A <= dist_B:
-                            delta_yaw = sol_A_norm
-                            cost_fun_val = np.sum(res_A.fun**2)
-                        else:
+                        self.rom_violation_counter += 1
+                        if self.rom_violation_counter >= 3:
                             delta_yaw = sol_B_norm
                             cost_fun_val = np.sum(res_B.fun**2)
+                            # Nach hartem Flip: Zähler resetten, da Seed B ab sofort Seed A wird (über delta_f_w_minus_1)
+                            self.rom_violation_counter = 0 
+                        else:
+                            # Hysterese noch nicht voll, bleibe gezwungen bei A
+                            delta_yaw = sol_A_norm
+                            cost_fun_val = np.sum(res_A.fun**2)
+                    else:
+                        # Beide illegal: Bleibe stur bei A
+                        self.rom_violation_counter = max(0, self.rom_violation_counter - 1)
+                        delta_yaw = sol_A_norm
+                        cost_fun_val = np.sum(res_A.fun**2)
                             
                     # Debug Logging for chosen Minima
                     if self.debug_log_file:
@@ -573,38 +597,11 @@ class Optimizer2D_Universal:
         
         if self.limrom_mode == "classic" or self.enable_limrom:
             res_list.extend([penalty_over_x, penalty_under_x, penalty_over_y, penalty_under_y])
-        elif self.limrom_mode == "euclidean":
-            # Euklidische "Cone" Limits: Wir projizieren den Arm-Vektor in das Parent-System.
-            # Da die Twist-Rotation um Z berechnet wird, MUSS die Längsachse des Arms die Z-Achse sein!
-            v_parent = r_rel.apply([0.0, 0.0, 1.0])
-            
-            # Bei Z als Längsachse gilt:
-            # - Auslenkung in X (v_x) entspricht der Abduktion (Euler Y)
-            # - Auslenkung in Y (v_y) entspricht der Flexion (Euler X)
-            v_x = v_parent[:, 0]
-            v_y = v_parent[:, 1]
-            
-            # Die Limits werden vom Winkel in euklidische Distanzen umgerechnet
-            lim_x_pos = np.sin(np.deg2rad(60.0))   # Abduktion pos
-            lim_x_neg = np.sin(np.deg2rad(-40.0))  # Abduktion neg
-            lim_y_pos = np.sin(np.deg2rad(30.0))   # Flexion pos
-            lim_y_neg = np.sin(np.deg2rad(-30.0))  # Flexion neg
-            
-            # Weiche "Soft-Limits" (quadratisch statt hart eckig), damit der Solver nicht stolpert!
-            pen_x_pos = np.maximum(0, v_x - lim_x_pos)**2 * 10.0
-            pen_x_neg = np.maximum(0, lim_x_neg - v_x)**2 * 10.0
-            pen_y_pos = np.maximum(0, v_y - lim_y_pos)**2 * 10.0
-            pen_y_neg = np.maximum(0, lim_y_neg - v_y)**2 * 10.0
-            
-            res_list.extend([pen_x_pos, pen_x_neg, pen_y_pos, pen_y_neg])
         elif self.limrom_mode == "paper":
             if (angle_x > x_upper_bound).any(): res_list.append(np.array([10.0]))
             elif (angle_x < x_lower_bound).any(): res_list.append(np.array([10.0]))
             if (angle_y > y_upper_bound).any(): res_list.append(np.array([10.0]))
             elif (angle_y < y_lower_bound).any(): res_list.append(np.array([10.0]))
-        elif self.limrom_mode == "exp":
-            res_list.extend([np.exp(penalty_over_x)-1, np.exp(penalty_under_x)-1, np.exp(penalty_over_y)-1, np.exp(penalty_under_y)-1])
-            
         if self.delta_delta_weight > 0.0:
             regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
             res_list.append([regularization_residual])
@@ -751,24 +748,28 @@ class Optimizer2D_Universal:
                     is_A_legal = (cost_L_A < 5.0) and (np.sum(res_A.fun**2) < 5.0)
                     is_B_legal = (cost_L_B < 5.0) and (np.sum(res_B.fun**2) < 5.0)
                     
-                    if is_A_legal and not is_B_legal:
+                    # Wenn beide legal sind, priorisiere immer Seed A (verhindert unnötiges Springen)
+                    if not hasattr(self, 'rom_violation_counter'): self.rom_violation_counter = 0
+                    
+                    if is_A_legal:
+                        self.rom_violation_counter = max(0, self.rom_violation_counter - 1)
                         best_yaw = sol_A_norm
                         best_cost = np.sum(res_A.fun**2)
                     elif is_B_legal and not is_A_legal:
-                        best_yaw = sol_B_norm
-                        best_cost = np.sum(res_B.fun**2)
-                        self.latest_jump_event = True
-                    else:
-                        # Tie-Breaker Proximity
-                        dist_A = np.abs((sol_A_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
-                        dist_B = np.abs((sol_B_norm - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi)
-                        if dist_A <= dist_B:
-                            best_yaw = sol_A_norm
-                            best_cost = np.sum(res_A.fun**2)
-                        else:
+                        self.rom_violation_counter += 1
+                        if self.rom_violation_counter >= 3:
                             best_yaw = sol_B_norm
                             best_cost = np.sum(res_B.fun**2)
                             self.latest_jump_event = True
+                            self.rom_violation_counter = 0 
+                        else:
+                            best_yaw = sol_A_norm
+                            best_cost = np.sum(res_A.fun**2)
+                    else:
+                        # Beide illegal: Bleibe bei A
+                        self.rom_violation_counter = max(0, self.rom_violation_counter - 1)
+                        best_yaw = sol_A_norm
+                        best_cost = np.sum(res_A.fun**2)
                             
                     optimization_success = res_A.success or res_B.success
                 else:

@@ -61,17 +61,11 @@ ENABLE_ANTI_WINDUP = True
 
 # LimRoM Mode for 2D Optimizer
 # Verfügbare Modi für 2D:
-#   "off"                : Pures Paper-Constraint (beta_0_hat = 0), keine anatomischen Strafen.
-#   "classic"            : Paper-Constraint + Lineare Strafe (Rechteck-Box) an den ROM-Grenzen.
-#   "euclidean"          : Paper-Constraint + Euklidische Ellipse-Cone Strafe aus der Literatur.
-#   "paper"              : Paper-Constraint + Diskreter 1-Punkt Strafwert bei ROM-Überschreitung.
-#   "exp"                : Paper-Constraint + Exponentiell wachsende Strafe bei ROM-Überschreitung.
-#   "pure_limrom_rad"    : Analysezweck: Ignoriert Twist, optimiert nur ROM-Box (Lineare Strafe in Rad).
-#   "pure_limrom_paper"  : Analysezweck: Ignoriert Twist, optimiert nur ROM-Box (1 Strafpunkt pro Überschreitung).
-#   "pure_limrom_exp"    : Analysezweck: Ignoriert Twist, optimiert nur ROM-Box (Exponentielle Strafe).
+#   "kinematic_constraints": Nur das 1D/2D Kinematik-Constraint ohne jede Gelenk-Grenzwerte.
+#   "classic"            : Paper-Constraint + Lineare Strafe bei ROM-Überschreitung.
 #   "dual_seed_referee"  : Experimentell: Dual-Seed Suche (pures Twist-Constraint), gefiltert durch LimRoM.
-LIMROM_MODE_1D = "dual_seed_referee"
-LIMROM_MODE_2D = "dual_seed_referee"
+LIMROM_MODE_1D = "classic"
+LIMROM_MODE_2D = "off"
 
 # Valley Jump Retry Validation (set to False to disable ROM checks during retries - for debugging)
 ENABLE_VALLEY_RETRY_VALIDATION = False
@@ -88,7 +82,7 @@ OPT_DELTA_DELTA_WEIGHT = 0 # OPT_WINDOW_SIZE / math.pi
 ENABLE_LOGGING = True
 ENABLE_DEBUG_LOGGING = True
 LOG_DIR = "logs/csv"
-SESSION_NAME = "session_81_dual1D2D" # Wird in den Dateinamen der Logs eingebaut
+SESSION_NAME = "session_90_get2drom" # Wird in den Dateinamen der Logs eingebaut
 LOG_FILE_NAME_1D = f"{SESSION_NAME}_1D.csv" # 1D Overall
 LOG_FILE_NAME_2D = f"{SESSION_NAME}_2D.csv"  # 2D Overall
 DEBUG_LOG_FILE_1D = f"{SESSION_NAME}_debug_1D.csv"  # 1D Debug Log
