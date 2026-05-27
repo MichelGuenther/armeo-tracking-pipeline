@@ -13,7 +13,7 @@ class Optimizer1D:
     The optimizer collects data in a sliding window and searches for the heading correction angle (delta_yaw) 
     that minimizes the measured movement (variance) on these two "forbidden" axes.
     """
-    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_valley_retry_validation=True, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, limrom_mode="off", mode_pure_constraint_referee=False, log_file="drift_log_1D.csv", debug_log_file=None):
+    def __init__(self, sensor_upper, sensor_lower, window_size=200, step_size=100, flat_valley_threshold=1e-4, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_valley_retry_validation=True, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, limrom_mode="off", mode_kinematic_constraints=False, log_file="drift_log_1D.csv", debug_log_file=None):
         """
         Initializes the 1D optimizer for a sensor pair.
         
@@ -34,10 +34,10 @@ class Optimizer1D:
         self.enable_singularity_filter = enable_singularity_filter
         self.enable_flat_valley_filter = enable_flat_valley_filter
         self.enable_anti_windup = enable_anti_windup
-        self.mode_pure_constraint_referee = mode_pure_constraint_referee
+        self.mode_kinematic_constraints = mode_kinematic_constraints
         self.limrom_mode = limrom_mode
         if self.limrom_mode == "dual_seed_referee":
-            self.mode_pure_constraint_referee = True
+            self.mode_kinematic_constraints = True
             
         self.rom_violation_counter = 0  # Hysteresis Counter
         self.delta_delta_weight = delta_delta_weight
@@ -74,14 +74,39 @@ class Optimizer1D:
         self.tau_b = tau_b_              # Tunable time constant for bias filter
         self.tau_delta = tau_delta_           # Tunable time constant for heading filter
         self.r_min = 0.1              # Singularity detection
+        
+        # --- Discontinuity Detection (Auto-Reset on Reconnection) ---
+        self.last_quat_upper = None  # Track last quaternion to detect sensor reconnections
+        self.last_quat_lower = None
+        self.discontinuity_threshold = np.deg2rad(60.0)  # 60° jump = new connection
 
     def add_packet_and_optimize(self, r_up_aligned, r_low_aligned):
         """
         Takes aligned sensor rotations (SciPy) from the manager/bridge,
         fills the sliding window and triggers the asynchronous optimization once the window is full.
         """
-        self.buffer_upper.append(r_up_aligned.as_quat())
-        self.buffer_lower.append(r_low_aligned.as_quat())
+        q_up = r_up_aligned.as_quat()
+        q_low = r_low_aligned.as_quat()
+        
+        # --- AUTO-RESET ON SENSOR RECONNECTION ---
+        # Detect discontinuities (large quaternion jumps > 60°) indicating sensor reconnection
+        if self.last_quat_upper is not None:
+            # Calculate angular distance between consecutive quaternions
+            q_diff_up = R.from_quat(self.last_quat_upper).inv() * R.from_quat(q_up)
+            q_diff_low = R.from_quat(self.last_quat_lower).inv() * R.from_quat(q_low)
+            # as_rotvec() gives rotation vector; magnitude = rotation angle in radians
+            angle_dist_up = np.linalg.norm(q_diff_up.as_rotvec())
+            angle_dist_low = np.linalg.norm(q_diff_low.as_rotvec())
+            
+            if angle_dist_up > self.discontinuity_threshold or angle_dist_low > self.discontinuity_threshold:
+                print(f"🔄 [1D] SENSOR RECONNECTION DETECTED! (Jump: {np.degrees(max(angle_dist_up, angle_dist_low)):.1f}°) Resetting optimizer state...")
+                self._reset_filter_state()
+        
+        self.last_quat_upper = q_up
+        self.last_quat_lower = q_low
+        
+        self.buffer_upper.append(q_up)
+        self.buffer_lower.append(q_low)
         
         if len(self.buffer_upper) >= self.window_size:
             if not self.is_calculating:
@@ -101,9 +126,21 @@ class Optimizer1D:
         self.current_heading_offset = self.target_heading_offset
         return self.current_heading_offset, self.latest_angle_x
 
+    def _reset_filter_state(self):
+        """Reset all filter states to prevent unbounded drift on sensor reconnection."""
+        self.b_w_minus_1 = 0.0
+        self.delta_w_minus_1 = 0.0
+        self.delta_f_w_minus_1 = 0.0
+        self.seed_B_w_minus_1 = np.pi
+        self.target_heading_offset = 0.0
+        self.current_heading_offset = 0.0
+        self.rom_violation_counter = 0
+        self.buffer_upper = []
+        self.buffer_lower = []
+    
     def _eval_limrom_cost(self, delta_yaw, r_upper_inv, r_lower_window):
         orig_limrom = self.limrom_mode
-        self.limrom_mode = "classic"
+        self.limrom_mode = "limrom_referee" # Temporär für Referee-Entscheidung aktivieren
         orig_weight = self.delta_delta_weight
         self.delta_delta_weight = 0.0
         res = self._residuals([delta_yaw], r_upper_inv, r_lower_window)
@@ -130,13 +167,13 @@ class Optimizer1D:
         lower_bound = np.deg2rad(-60.0)
         
         # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
+        # Excludes mirrored or anatomically impossible orientations (the "second valley")
+        # by strictly penalizing states outside valid joint bounds (cf. Eq. 14).
         # least_squares quadriert automatisch. Für einen Faktor von 100 müssen wir hier * 10.0 nehmen.
         penalty_over = np.maximum(0, angle_x - upper_bound) * 2.0
         penalty_under = np.maximum(0, lower_bound - angle_x) * 2.0
         
-        res_list = [angle_y, angle_z]
-        if getattr(self, 'limrom_mode', 'off') == "classic" or getattr(self, 'enable_limrom', False):
-            res_list.extend([penalty_over, penalty_under])
+        res_list = [angle_y, angle_z]#, penalty_over, penalty_under]
             
         if self.delta_delta_weight > 0.0:
             regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
@@ -208,16 +245,8 @@ class Optimizer1D:
                 # --- LEVENBERG-MARQUARDT (GAUSS-NEWTON) OPTIMIZATION ---
                 # Der perfekte Startpunkt aus dem vorherigen Fenster
                 initial_guess = [self.delta_f_w_minus_1]
-                if not self.mode_pure_constraint_referee and self.w_index == 0:
-                    best_cost_init = float('inf')
-                    for test_deg in range(-180, 180, 15):
-                        test_rad = np.deg2rad(test_deg)
-                        cost_init = np.sum(self._residuals([test_rad], r_parent_inv, r_child)**2)
-                        if cost_init < best_cost_init:
-                            best_cost_init = cost_init
-                            initial_guess = [test_rad]
-                    print(f"🌍 [2D] Initial Grid Search abgeschlossen. Starte bei {np.degrees(initial_guess[0]):.1f}°")
-                if not self.mode_pure_constraint_referee and self.w_index == 0:
+                # Grid Search nur im 'classic' Modus
+                if self.w_index == 0 and getattr(self, 'limrom_mode', 'classic') == 'classic':
                     best_cost_init = float('inf')
                     for test_deg in range(-180, 180, 15):
                         test_rad = np.deg2rad(test_deg)
@@ -266,93 +295,55 @@ class Optimizer1D:
                 self.latest_jump_event = False
                 self.latest_seed_lost = False
                 
-                if self.mode_pure_constraint_referee:
-                    # --- PURE CONSTRAINT REFEREE (DUAL SEED) ---
-                    seed_A = self.delta_f_w_minus_1
-                    seed_B = self.delta_f_w_minus_1 + np.pi
-                    seed_B = (seed_B + np.pi) % (2 * np.pi) - np.pi
-                    
-                    res_A = least_squares(self._residuals, [seed_A], args=(r_upper_inv, r_lower), method='lm')
-                    res_B = least_squares(self._residuals, [seed_B], args=(r_upper_inv, r_lower), method='lm')
-                    
+                if self.mode_kinematic_constraints:
+                    # --- 1D DUAL SEED REFEREE (VEREINFACHT) ---
+                    # 1. Optimierung im aktuellen Tal (gestartet beim letzten Filter-Wert)
+                    res_A = least_squares(self._residuals, [self.delta_f_w_minus_1], args=(r_upper_inv, r_lower), method='lm')
                     sol_A = res_A.x[0]
-                    sol_B = res_B.x[0]
                     sol_A_norm = (sol_A + np.pi) % (2 * np.pi) - np.pi
+                    
+                    # 2. Den exakt gespiegelten Punkt (180 Grad entfernt) als Seed B nehmen
+                    sol_B_norm = (sol_A_norm + np.pi) % (2 * np.pi) - np.pi
+                    
+                    # Wir prüfen, ob im 180° gespiegelten Punkt ein echtes Minimum existiert, indem wir dort kurz optimieren
+                    res_B = least_squares(self._residuals, [sol_B_norm], args=(r_upper_inv, r_lower), method='lm')
+                    sol_B = res_B.x[0]
                     sol_B_norm = (sol_B + np.pi) % (2 * np.pi) - np.pi
                     
-                    # Coarse Fallback
-                    dist_to_A = np.abs((sol_B_norm - sol_A_norm + np.pi) % (2 * np.pi) - np.pi)
-                    if dist_to_A < np.deg2rad(60.0):
-                        print(f"⚠️ [1D] Täler verschmolzen (Distanz {np.degrees(dist_to_A):.1f}°)! Starte Grid-Scan für Ausweich-Tal...")
-                        self.latest_seed_lost = True
-                        best_coarse_cost = float('inf')
-                        best_coarse_yaw = sol_B_norm
-                        for test_deg in range(-180, 180, 30):
-                            test_rad = np.deg2rad(test_deg)
-                            dist_to_A_test = np.abs((test_rad - sol_A_norm + np.pi) % (2 * np.pi) - np.pi)
-                            if dist_to_A_test > np.deg2rad(60.0):
-                                cost_coarse = np.sum(self._residuals([test_rad], r_upper_inv, r_lower)**2)
-                                if cost_coarse < best_coarse_cost:
-                                    best_coarse_cost = cost_coarse
-                                    best_coarse_yaw = test_rad
-                        res_C = least_squares(self._residuals, [best_coarse_yaw], args=(r_upper_inv, r_lower), method='lm')
-                        sol_B = res_C.x[0]
-                        sol_B_norm = (sol_B + np.pi) % (2 * np.pi) - np.pi
-                        res_B = res_C
-                        
-                        # Coarse Grid Logging
-                        if self.debug_log_file:
-                            for test_deg in range(-180, 180, 5):
-                                test_rad = np.deg2rad(test_deg)
-                                cost_coarse = np.sum(self._residuals([test_rad], r_upper_inv, r_lower)**2)
-                                with open(self.debug_log_file, "a") as f:
-                                    f.write(f"{time.time()},{self.w_index + 1},{test_deg:.4f},{cost_coarse:.6f},0,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(sol_A_norm):.4f}\n")
-                                    
-                    # Referee Costs
+                    # 3. Berechne Totale Kosten (Kinematic + LimRom) für beide Täler
                     orig_limrom = self.limrom_mode
-                    orig_weight = self.delta_delta_weight
-                    self.limrom_mode = "off"
-                    self.delta_delta_weight = 0.0
-                    cost_L_A = self._eval_limrom_cost(sol_A_norm, r_upper_inv, r_lower)
-                    cost_L_B = self._eval_limrom_cost(sol_B_norm, r_upper_inv, r_lower)
+                    self.limrom_mode = "limrom_referee"
+                    
+                    cost_total_A = np.sum(self._residuals([sol_A_norm], r_upper_inv, r_lower)**2)
+                    cost_total_B = np.sum(self._residuals([sol_B_norm], r_upper_inv, r_lower)**2)
+                    
                     self.limrom_mode = orig_limrom
-                    self.delta_delta_weight = orig_weight
                     
-                    is_A_legal = (cost_L_A < 5.0) and (np.sum(res_A.fun**2) < 5.0)
-                    is_B_legal = (cost_L_B < 5.0) and (np.sum(res_B.fun**2) < 5.0)
-                    
-                    # Wenn beide legal sind, priorisiere immer Seed A (verhindert unnötiges Springen)
-                    # Hysterese: Seed B muss 3x in Folge allein legal sein, um zu gewinnen
-                    if is_A_legal:
-                        self.rom_violation_counter = max(0, self.rom_violation_counter - 1)
-                        delta_yaw = sol_A_norm
-                        cost_fun_val = np.sum(res_A.fun**2)
-                    elif is_B_legal and not is_A_legal:
+                    # 4. Flip-Entscheidung: Ist das 180° gespiegelte Tal BESSER als unser aktuelles?
+                    # Da B oft astronomisch hoch ist (weil es kein Minimum ist), passiert meist nichts.
+                    # Aber in Singularitäten (flaches Tal) entscheidet LimRom, und B könnte gewinnen.
+                    if cost_total_B < cost_total_A:
                         self.rom_violation_counter += 1
                         if self.rom_violation_counter >= 3:
                             delta_yaw = sol_B_norm
-                            cost_fun_val = np.sum(res_B.fun**2)
-                            # Nach hartem Flip: Zähler resetten, da Seed B ab sofort Seed A wird (über delta_f_w_minus_1)
-                            self.rom_violation_counter = 0 
+                            cost_fun_val = cost_total_B
+                            print(f"🔀 [1D] DUAL SEED FLIP: Tal B ({cost_total_B:.1f}) hat gewonnen gegen Tal A ({cost_total_A:.1f}).")
+                            self.rom_violation_counter = 0
                         else:
-                            # Hysterese noch nicht voll, bleibe gezwungen bei A
                             delta_yaw = sol_A_norm
-                            cost_fun_val = np.sum(res_A.fun**2)
+                            cost_fun_val = cost_total_A
                     else:
-                        # Beide illegal: Bleibe stur bei A
                         self.rom_violation_counter = max(0, self.rom_violation_counter - 1)
                         delta_yaw = sol_A_norm
-                        cost_fun_val = np.sum(res_A.fun**2)
+                        cost_fun_val = cost_total_A
                             
                     # Debug Logging for chosen Minima
                     if self.debug_log_file:
-                        cost_A = np.sum(res_A.fun**2)
-                        cost_B = np.sum(res_B.fun**2)
                         is_A_best = 1 if delta_yaw == sol_A_norm else 2
                         is_B_best = 1 if delta_yaw == sol_B_norm else 2
                         with open(self.debug_log_file, "a") as f:
-                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(sol_A_norm):.4f},{cost_A:.6f},{is_A_best},{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(delta_yaw):.4f}\n")
-                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(sol_B_norm):.4f},{cost_B:.6f},{is_B_best},{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(delta_yaw):.4f}\n")
+                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(sol_A_norm):.4f},{cost_total_A:.6f},{is_A_best},{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(delta_yaw):.4f}\n")
+                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(sol_B_norm):.4f},{cost_total_B:.6f},{is_B_best},{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(delta_yaw):.4f}\n")
                             
                     delta_w = delta_yaw
                     optimization_success = True
@@ -365,12 +356,14 @@ class Optimizer1D:
                         args=(r_upper_inv, r_lower), 
                         method='lm'
                     )
-                    
                     best_yaw = res.x[0]
                     best_cost = res.cost * 2.0  # res.cost ist bei scipy immer 0.5 * sum(residuals**2)
                     
                     if self.debug_log_file:
                         with open(self.debug_log_file, "a") as f:
+                            # Log the starting seed
+                            f.write(f"{time.time()},{self.w_index + 1},{np.degrees(initial_guess[0]):.4f},0.0,3,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(initial_guess[0]):.4f}\n")
+                            # Log the actual optimized minimum
                             f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_up:.6E},{movement_var_low:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
                     
                     opt_duration = time.time() - opt_start
@@ -416,22 +409,39 @@ class Optimizer1D:
                     is_singular = False
                     s_w = 1.0 # Trust fully without dampening
                 
-                # --- JUMP OVERRIDE FÜR DEN FILTER ---
-                if self.mode_pure_constraint_referee:
+                # --- JUMP STRATEGY / VALLEY TRACKING ---
+                if self.mode_kinematic_constraints:
                     jump_diff = (delta_w - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
                     if np.abs(jump_diff) > np.deg2rad(120.0):
                         # Es fand ein Valley Jump statt!
                         jump_offset = jump_diff
-                        self.delta_w_minus_1 += jump_offset
-                        self.delta_f_w_minus_1 += jump_offset
                         self.latest_jump_event = True
+                
+                # Filter smoothing parameters based on time constants
+                k_b_w =     max(1.0 - np.exp(-np.log(2) * self.T_s / self.tau_b), 1.0 / w_idx)
+                k_delta_w = max(1.0 - np.exp(-np.log(2) * self.T_s / self.tau_delta), 1.0 / w_idx)
+                
+                # --- JUMP DETECTION AND FILTER ALIGNMENT ---
+                # Check for 1D Valley Jumps
+                if hasattr(self, 'jump_offset') and self.jump_offset != 0.0:
+                    jump_offset = self.jump_offset
+                    self.delta_w_minus_1 = (self.delta_w_minus_1 + jump_offset + np.pi) % (2 * np.pi) - np.pi
+                    self.delta_f_w_minus_1 = (self.delta_f_w_minus_1 + jump_offset + np.pi) % (2 * np.pi) - np.pi
+                    if abs(jump_offset) > np.deg2rad(50.0):
                         print(f"🦘 [1D] Valley Jump detektiert! Filter-Historie um exakt {np.degrees(jump_offset):.1f}° verschoben.")
                         
-                # Update bias (learned yaw drift rate)
-                b_w = self.b_w_minus_1 + s_w * k_b_w * (delta_w - self.delta_w_minus_1 - self.b_w_minus_1)
+                # Update bias (learned yaw drift rate) - Angle-Safe Version!
+                if w_idx == 1:
+                    b_w = 0.0
+                    delta_f_w = delta_w
+                else:
+                    diff_w_w1 = (delta_w - self.delta_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
+                    b_w = self.b_w_minus_1 + s_w * k_b_w * (diff_w_w1 - self.b_w_minus_1)
+                    
+                    diff_w_fw1 = (delta_w - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
+                    delta_f_w = self.delta_f_w_minus_1 + b_w + s_w * k_delta_w * (diff_w_fw1 - b_w)
                 
-                # Filtered heading offset (drift correction)
-                delta_f_w = self.delta_f_w_minus_1 + b_w + s_w * k_delta_w * (delta_w - self.delta_f_w_minus_1 - b_w)
+                delta_f_w = (delta_f_w + np.pi) % (2 * np.pi) - np.pi
                 
                 # Remember filter state for the next window
                 self.b_w_minus_1 = b_w
@@ -449,9 +459,11 @@ class Optimizer1D:
                 self.latest_angle_x = np.degrees(np.mean(best_angle_x))
                 avg_angle_x_deg = np.degrees(np.mean(best_angle_x))
                 
-                print(f"[{time.strftime('%H:%M:%S')}] 1D Optimizer (Elbow): Target offset = {np.degrees(self.current_heading_offset):.2f}°")
-                print(f"    \033[1;42m-> GELENKWINKEL 1D (Flexion/Extension): {self.latest_angle_x:.1f}° \033[0m")
-                print(f"    -> (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s)")
+                print(f"\033[95m[{time.strftime('%H:%M:%S')}]\033[0m 1D Optimizer (Elbow):")
+                print(f"    -> Filter Pipeline: Raw LM: \033[96m{np.degrees(delta_w):.2f}°\033[0m | Filtered Out: \033[38;5;208m{np.degrees(delta_f_w):.2f}°\033[0m | Bias: \033[93m{np.degrees(b_w):.4f}°\033[0m")
+                print(f"    -> Modus: \033[93m{getattr(self, 'limrom_mode', 'off')}\033[0m | Kinematic Cost (LM Error): \033[91m{cost_fun_val:.6f}\033[0m")
+                print(f"    -> GELENKWINKEL 1D (Flexion/Extension): \033[92m{self.latest_angle_x:.1f}°\033[0m")
+                print(f"    -> Visibility (\033[94mr_w: {r_w:.2f}\033[0m) | Singularity: \033[91m{is_singular}\033[0m | duration: {opt_duration:.3f}s")
                 
                 # Logging
                 if self.log_file:
@@ -471,7 +483,7 @@ class Optimizer2D_Universal:
     The optimizer searches for the heading correction angle (delta_yaw) that minimizes the variance 
     on this single "forbidden" axis.
     """
-    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_valley_retry_validation=True, enable_limrom=False, limrom_mode="off", mode_pure_constraint_referee=False, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_2D.csv", debug_log_file=None):
+    def __init__(self, sensor_parent, sensor_child, window_size=200, step_size=100, flat_valley_threshold=1e-8, enable_singularity_filter=True, enable_flat_valley_filter=True, enable_anti_windup=True, enable_valley_retry_validation=True, enable_limrom=False, limrom_mode="off", mode_kinematic_constraints=False, tau_b_=2.8, tau_delta_=0.7, delta_delta_weight=0.0, log_file="drift_log_2D.csv", debug_log_file=None):
         self.s_parent = sensor_parent
         self.s_child = sensor_child
         self.window_size = window_size
@@ -486,9 +498,9 @@ class Optimizer2D_Universal:
         self.debug_log_file = debug_log_file
 
         self.limrom_mode = limrom_mode
-        self.mode_pure_constraint_referee = False
+        self.mode_kinematic_constraints = False
         if self.limrom_mode == "dual_seed_referee":
-            self.mode_pure_constraint_referee = True
+            self.mode_kinematic_constraints = True
             
         self.latest_angles = {'x': 0.0, 'y': 0.0, 'z': 0.0}
         self.latest_jump_event = False
@@ -519,10 +531,35 @@ class Optimizer2D_Universal:
         self.tau_b = tau_b_             # Tunable time constant for bias filter
         self.tau_delta = tau_delta_          # Tunable time constant for heading filter
         self.r_min = 0.1              # Empirically tuned threshold for singularity detection
+        
+        # --- Discontinuity Detection (Auto-Reset on Reconnection) ---
+        self.last_quat_parent = None  # Track last quaternion to detect sensor reconnections
+        self.last_quat_child = None
+        self.discontinuity_threshold = np.deg2rad(60.0)  # 60° jump = new connection
 
     def add_packet_and_optimize(self, r_par_aligned, r_chi_aligned):
-        self.buffer_parent.append(r_par_aligned.as_quat())
-        self.buffer_child.append(r_chi_aligned.as_quat())
+        q_par = r_par_aligned.as_quat()
+        q_chi = r_chi_aligned.as_quat()
+        
+        # --- AUTO-RESET ON SENSOR RECONNECTION ---
+        # Detect discontinuities (large quaternion jumps > 60°) indicating sensor reconnection
+        if self.last_quat_parent is not None:
+            # Calculate angular distance between consecutive quaternions
+            q_diff_par = R.from_quat(self.last_quat_parent).inv() * R.from_quat(q_par)
+            q_diff_chi = R.from_quat(self.last_quat_child).inv() * R.from_quat(q_chi)
+            # as_rotvec() gives rotation vector; magnitude = rotation angle in radians
+            angle_dist_par = np.linalg.norm(q_diff_par.as_rotvec())
+            angle_dist_chi = np.linalg.norm(q_diff_chi.as_rotvec())
+            
+            if angle_dist_par > self.discontinuity_threshold or angle_dist_chi > self.discontinuity_threshold:
+                print(f"🔄 [2D] SENSOR RECONNECTION DETECTED! (Jump: {np.degrees(max(angle_dist_par, angle_dist_chi)):.1f}°) Resetting optimizer state...")
+                self._reset_filter_state()
+        
+        self.last_quat_parent = q_par
+        self.last_quat_child = q_chi
+        
+        self.buffer_parent.append(q_par)
+        self.buffer_child.append(q_chi)
         
         if len(self.buffer_parent) >= self.window_size:
             if not self.is_calculating:
@@ -541,9 +578,21 @@ class Optimizer2D_Universal:
         self.current_heading_offset = self.target_heading_offset
         return self.current_heading_offset, self.latest_angles
 
+    def _reset_filter_state(self):
+        """Reset all filter states to prevent unbounded drift on sensor reconnection."""
+        self.b_w_minus_1 = 0.0
+        self.delta_w_minus_1 = 0.0
+        self.delta_f_w_minus_1 = 0.0
+        self.seed_B_w_minus_1 = np.pi
+        self.target_heading_offset = 0.0
+        self.current_heading_offset = 0.0
+        self.rom_violation_counter = 0
+        self.buffer_parent = []
+        self.buffer_child = []
+    
     def _eval_limrom_cost(self, delta_yaw, r_parent_inv, r_child_window):
         orig_limrom = self.limrom_mode
-        self.limrom_mode = "classic"
+        self.limrom_mode = "limrom_referee" # Temporär für Referee-Entscheidung aktivieren
         orig_weight = self.delta_delta_weight
         self.delta_delta_weight = 0.0
         res = self._residuals([delta_yaw], r_parent_inv, r_child_window)
@@ -560,48 +609,42 @@ class Optimizer2D_Universal:
         r_child_corrected = rot_offset * r_child_window
         
         # 2. Calculate absolute joint orientation (relative quaternion)
-        # Corresponds to relative joint orientation (cf. Equation 2 in the paper)
         r_rel = r_parent_inv * r_child_corrected
         
-        # 3. 2DoF Constraint formula from the paper (cf. Equations 4 & 6 for the forbidden axis):
-        # SciPy provides q in format [x, y, z, w]. The paper uses [q0, q1, q2, q3] with q0 = w.
+        # 3. 2DoF Constraint formula from the paper
         q_scipy = r_rel.as_quat()
         x = q_scipy[:, 0] # q1
         y = q_scipy[:, 1] # q2
         z = q_scipy[:, 2] # q3
         w = q_scipy[:, 3] # q0
         
-        # Axial rotation (twist) is mapped to the Z-axis in this model.
-        # The corresponding angle derivation using quaternion relations is:
-        # beta_0_hat = arcsin(2 * q0 * q3 + 2 * q1 * q2)
+        # --- ALTE WINKELBERECHNUNG (auskommentiert) ---
+        beta_0_hat = np.arcsin(np.clip(2 * w * z + 2 * x * y, -1.0, 1.0))
         
-        # np.clip protects against float inaccuracies
-        inner_term = np.clip(2 * w * z + 2 * x * y, -1.0, 1.0)
-        beta_0_hat = np.arcsin(inner_term)
+        # --- KORREKTE TORSIONS-BERECHNUNG (Gimbal-Lock frei) ---
+        #beta_0_hat = 2.0 * np.arctan2(z, w)
         
-        # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) - CLASSIC MODE ---
+        # --- ANATOMICAL CONSTRAINTS (LimRoM PENALTY) ---
         angle_x = np.arctan2(2 * (w * x + y * z), 1 - 2 * (x**2 + y**2))
         angle_y = np.arcsin(np.clip(2 * w * y - 2 * z * x, -1.0, 1.0))
         
-        x_upper_bound = np.deg2rad(30.0)
-        x_lower_bound = np.deg2rad(-30.0)
-        y_upper_bound = np.deg2rad(60.0)
-        y_lower_bound = np.deg2rad(-40.0)
+        x_upper_bound = np.deg2rad(35.0)
+        x_lower_bound = np.deg2rad(-35.0)
+        y_upper_bound = np.deg2rad(140.0)
+        y_lower_bound = np.deg2rad(-170.0)
         
-        penalty_over_x = np.maximum(0, angle_x - x_upper_bound)
-        penalty_under_x = np.maximum(0, x_lower_bound - angle_x)
+        gl_mask = np.abs(np.abs(angle_y) - (np.pi / 2.0)) < 0.2
+        
+        penalty_over_x = np.where(gl_mask, 0.0, np.maximum(0, angle_x - x_upper_bound))
+        penalty_under_x = np.where(gl_mask, 0.0, np.maximum(0, x_lower_bound - angle_x))
         penalty_over_y = np.maximum(0, angle_y - y_upper_bound)
         penalty_under_y = np.maximum(0, y_lower_bound - angle_y)
         
         res_list = [np.atleast_1d(beta_0_hat)]
         
-        if self.limrom_mode == "classic" or self.enable_limrom:
+        # LimRom ist standardmäßig deaktiviert, außer der User wünscht es explizit für ein Paper oder der Dual Seed Referee prüft die Täler!
+        if self.limrom_mode in ["limrom_paper", "limrom_referee"] or getattr(self, 'enable_limrom', False):
             res_list.extend([penalty_over_x, penalty_under_x, penalty_over_y, penalty_under_y])
-        elif self.limrom_mode == "paper":
-            if (angle_x > x_upper_bound).any(): res_list.append(np.array([10.0]))
-            elif (angle_x < x_lower_bound).any(): res_list.append(np.array([10.0]))
-            if (angle_y > y_upper_bound).any(): res_list.append(np.array([10.0]))
-            elif (angle_y < y_lower_bound).any(): res_list.append(np.array([10.0]))
         if self.delta_delta_weight > 0.0:
             regularization_residual = (self.delta_f_w_minus_1 - delta_yaw) * np.sqrt(self.delta_delta_weight)
             res_list.append([regularization_residual])
@@ -663,6 +706,20 @@ class Optimizer2D_Universal:
             else:
                 # --- LEVENBERG-MARQUARDT (GAUSS-NEWTON) OPTIMIZATION ---
                 initial_guess = [self.delta_f_w_minus_1]
+                # Grid Search in Frame 0: IMMER machen, um das richtige anatomische Tal zu finden!
+                # Dazu temporär LimRom auf 'classic' schalten, falls wir in 'kinematic_constraints' sind.
+                if self.w_index == 0:
+                    best_cost_init = float('inf')
+                    orig_limrom = getattr(self, 'limrom_mode', 'off')
+                    self.limrom_mode = 'classic' # Temporär für den Scan aktivieren
+                    for test_deg in range(-180, 180, 15):
+                        test_rad = np.deg2rad(test_deg)
+                        cost_init = np.sum(self._residuals([test_rad], r_parent_inv, r_child)**2)
+                        if cost_init < best_cost_init:
+                            best_cost_init = cost_init
+                            initial_guess = [test_rad]
+                    self.limrom_mode = orig_limrom # Zurücksetzen
+                    print(f"🌍 [2D] Initial Grid Search abgeschlossen. Starte bei {np.degrees(initial_guess[0]):.1f}°")
                 
                 self._current_debug_info = {
                     'w_index': self.w_index + 1,
@@ -702,7 +759,7 @@ class Optimizer2D_Universal:
                 self.latest_jump_event = False
                 self.latest_seed_lost = False
                 
-                if self.mode_pure_constraint_referee:
+                if self.mode_kinematic_constraints:
                     # --- PURE CONSTRAINT REFEREE (DUAL SEED 2D TRACKING) ---
                     seed_A = self.delta_f_w_minus_1
                     res_A = least_squares(self._residuals, [seed_A], args=(r_parent_inv, r_child), method='lm')
@@ -773,6 +830,7 @@ class Optimizer2D_Universal:
                             
                     optimization_success = res_A.success or res_B.success
                 else:
+                    # --- LEVENBERG-MARQUARDT (STANDARD) ---
                     res = least_squares(
                         self._residuals, 
                         initial_guess, 
@@ -785,10 +843,13 @@ class Optimizer2D_Universal:
                 
                 if self.debug_log_file:
                     with open(self.debug_log_file, "a") as f:
+                        # Log the starting seed
+                        f.write(f"{time.time()},{self.w_index + 1},{np.degrees(initial_guess[0]):.4f},0.0,3,{movement_var_par:.6E},{movement_var_chi:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(initial_guess[0]):.4f}\n")
+                        # Log the actual optimized minimum
                         f.write(f"{time.time()},{self.w_index + 1},{np.degrees(best_yaw):.4f},{best_cost:.6f},1,{movement_var_par:.6E},{movement_var_chi:.6E},{int(is_flat_valley)},{r_w:.4f},{np.degrees(best_yaw):.4f}\n")
                 
                 opt_duration = time.time() - opt_start
-                delta_w = best_yaw
+                delta_w = (best_yaw + np.pi) % (2 * np.pi) - np.pi
                 cost_fun_val = best_cost
             
             if optimization_success:
@@ -797,7 +858,6 @@ class Optimizer2D_Universal:
                 
                 # --- HEADING FILTER / BIAS EXTRAPOLATION ---
                 if self.enable_singularity_filter:
-                    # Ein Flat Valley Event zählt nur dann als singulär, wenn der Filter dafür auch aktiviert ist
                     is_singular_due_to_flat_valley = is_flat_valley and self.enable_flat_valley_filter
                     is_singular = (r_w < self.r_min) or is_singular_due_to_flat_valley
                     s_w = 0.0 if is_singular else r_w
@@ -805,12 +865,10 @@ class Optimizer2D_Universal:
                         print(f"💤 [2D] Flat Valley ACTIVE! Arm held still. Using bias extrapolation.")
                     elif is_singular:
                         print(f"⚠️ [2D] Singularity filter ACTIVE! (Rating (r_w): {r_w:.3f} < {self.r_min}). Using bias extrapolation.")
-##############################################################################                   
+                    
                     # --- STATE OVERRIDE (ANTI WIND-UP) ---
                     if is_singular and self.enable_anti_windup:
-                        # Verhindert, dass ein fehlerhafter Müllwert für den nächsten Frame gespeichert wird
-                        delta_w = self.delta_f_w_minus_1 + self.b_w_minus_1
-##############################################################################
+                        delta_w = (self.delta_f_w_minus_1 + self.b_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
                 else:
                     is_singular = False
                     s_w = 1.0
@@ -819,9 +877,18 @@ class Optimizer2D_Universal:
                 k_b_w =     max(1.0 - np.exp(-np.log(2) * self.T_s / self.tau_b), 1.0 / w_idx)
                 k_delta_w = max(1.0 - np.exp(-np.log(2) * self.T_s / self.tau_delta), 1.0 / w_idx)
                 
-                # Calculate new drift rate and filtered offset
-                b_w = self.b_w_minus_1 + s_w * k_b_w * (delta_w - self.delta_w_minus_1 - self.b_w_minus_1)
-                delta_f_w = self.delta_f_w_minus_1 + b_w + s_w * k_delta_w * (delta_w - self.delta_f_w_minus_1 - b_w)
+                # Calculate new drift rate and filtered offset (Angle-Safe Version!)
+                if w_idx == 1:
+                    b_w = 0.0
+                    delta_f_w = delta_w
+                else:
+                    diff_w_w1 = (delta_w - self.delta_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
+                    b_w = self.b_w_minus_1 + s_w * k_b_w * (diff_w_w1 - self.b_w_minus_1)
+                    
+                    diff_w_fw1 = (delta_w - self.delta_f_w_minus_1 + np.pi) % (2 * np.pi) - np.pi
+                    delta_f_w = self.delta_f_w_minus_1 + b_w + s_w * k_delta_w * (diff_w_fw1 - b_w)
+                
+                delta_f_w = (delta_f_w + np.pi) % (2 * np.pi) - np.pi
                 
                 self.b_w_minus_1 = b_w
                 self.delta_w_minus_1 = delta_w
@@ -854,7 +921,8 @@ class Optimizer2D_Universal:
                 angle_y_rad = np.arcsin(np.clip(2 * (w * y - z * x), -1.0, 1.0))
 
                 # Z-Achse (oft als Yaw bezeichnet)
-                angle_z_rad = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y**2 + z**2))
+                # KORREKTUR: Torsion Gimbal-Lock-frei berechnen
+                angle_z_rad = 2.0 * np.arctan2(z, w)
 
                 # 3. Umwandlung von Radiant in Grad
                 angle_x_deg = np.rad2deg(angle_x_rad)
@@ -866,9 +934,11 @@ class Optimizer2D_Universal:
                 self.latest_angles['y'] = np.mean(angle_y_deg)
                 self.latest_angles['z'] = np.mean(angle_z_deg)
 
-                print(f"[{time.strftime('%H:%M:%S')}] 2D Optimizer (Shoulder): Target offset = {np.degrees(self.current_heading_offset):.2f}°")
-                print(f"    -> Gelenkwinkel / Angles (X/Y/Z) of the best solution: {self.latest_angles['x']:.1f}°, {self.latest_angles['y']:.1f}°, {self.latest_angles['z']:.1f}°")    
-                print(f"    -> (r_w: {r_w:.2f}; duration: {opt_duration:.3f}s)")
+                print(f"\033[95m[{time.strftime('%H:%M:%S')}]\033[0m 2D Optimizer (Shoulder):")
+                print(f"    -> Filter Pipeline: Raw LM: \033[96m{np.degrees(delta_w):.2f}°\033[0m | Filtered Out: \033[38;5;208m{np.degrees(delta_f_w):.2f}°\033[0m | Bias: \033[93m{np.degrees(b_w):.4f}°\033[0m")
+                print(f"    -> Modus: \033[93m{getattr(self, 'limrom_mode', 'off')}\033[0m | Kinematic Cost (LM Error): \033[91m{cost_fun_val:.6f}\033[0m")
+                print(f"    -> Gelenkwinkel / Angles (X/Y/Z): \033[92m{self.latest_angles['x']:.1f}°, {self.latest_angles['y']:.1f}°, {self.latest_angles['z']:.1f}°\033[0m")    
+                print(f"    -> Visibility (\033[94mr_w: {r_w:.2f}\033[0m) | Singularity: \033[91m{is_singular}\033[0m | duration: {opt_duration:.3f}s")
 
                 # Logging
                 if self.log_file:

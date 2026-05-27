@@ -49,7 +49,20 @@ class ModeKinematicConstraintsStrategy1D(TrackerStrategy1D):
     def run(self, r_upper_inv, r_lower, initial_guess, movement_var_up, movement_var_low, is_flat_valley, r_w):
         self.log_coarse_search(r_upper_inv, r_lower, self.residuals)
         
-        res = least_squares(self.residuals, initial_guess, args=(r_upper_inv, r_lower), method='lm')
+        if self.opt.w_index == 0:
+            best_grid_cost = float('inf')
+            best_grid_yaw = initial_guess[0]
+            for test_deg in range(-180, 180, 5):
+                test_rad = np.deg2rad(test_deg)
+                res_val = self.residuals([test_rad], r_upper_inv, r_lower)
+                c = np.sum(res_val**2)
+                if c < best_grid_cost:
+                    best_grid_cost = c
+                    best_grid_yaw = test_rad
+            res = least_squares(self.residuals, [best_grid_yaw], args=(r_upper_inv, r_lower), method='lm')
+        else:
+            res = least_squares(self.residuals, initial_guess, args=(r_upper_inv, r_lower), method='lm')
+            
         best_yaw = res.x[0]
         best_cost = res.cost * 2.0
         
@@ -240,7 +253,20 @@ class ModeKinematicConstraintsStrategy2D(TrackerStrategy2D):
     def run(self, r_parent_inv, r_child, initial_guess, movement_var_par, movement_var_chi, is_flat_valley, r_w):
         self.log_coarse_search(r_parent_inv, r_child, self.residuals)
         
-        res = least_squares(self.residuals, initial_guess, args=(r_parent_inv, r_child), method='lm')
+        if self.opt.w_index == 0:
+            best_grid_cost = float('inf')
+            best_grid_yaw = initial_guess[0]
+            for test_deg in range(-180, 180, 5):
+                test_rad = np.deg2rad(test_deg)
+                res_val = self.residuals([test_rad], r_parent_inv, r_child)
+                c = np.sum(res_val**2)
+                if c < best_grid_cost:
+                    best_grid_cost = c
+                    best_grid_yaw = test_rad
+            res = least_squares(self.residuals, [best_grid_yaw], args=(r_parent_inv, r_child), method='lm')
+        else:
+            res = least_squares(self.residuals, initial_guess, args=(r_parent_inv, r_child), method='lm')
+            
         best_yaw = res.x[0]
         best_cost = res.cost * 2.0
         

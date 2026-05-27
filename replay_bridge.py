@@ -13,7 +13,7 @@ from test_bridge import viewer_process, ACTIVE_SENSORS, SENSOR_HZ
 # ==============================================================================
 
 # Die Datei, die wir mit record_sensor_data.py aufgenommen haben:
-CSV_FILE = "logs/raw_sensor_recording_long.csv"
+CSV_FILE = "logs/raw_sensor_recording_2.csv"
 
 # Wiedergabegeschwindigkeit (1.0 = Echtzeit, 2.0 = Doppelt so schnell).
 # Tipp: Setze es auf 0.0, um die Daten in Sekundenschnelle durch den 
@@ -34,6 +34,9 @@ async def replay_csv(queue, filename):
         last_csv_time = None
         packet_count = 0
         
+        freq_last_time = time.time()
+        freq_packet_count = 0
+        
         for row in reader:
             try:
                 csv_time = float(row['timestamp'])
@@ -46,25 +49,46 @@ async def replay_csv(queue, filename):
                         
                 last_csv_time = csv_time
                 
+                # Dynamisches Mapping der Sensor-IDs (Falls sich die MAC-Adressen zwischen Replay und aktuellem Skript geändert haben)
+                if packet_count == 0:
+                    csv_sensors = [col.replace('_w', '') for col in row.keys() if col.endswith('_w')]
+                    print(f"📡 Dynamisches Mapping für Replay: CSV Sensoren {csv_sensors} auf Active {ACTIVE_SENSORS} gemappt.")
+                    # Speichere das Mapping {AktuellerSensorName: CSV_Name}
+                    sensor_map = {}
+                    for i, s_id in enumerate(ACTIVE_SENSORS):
+                        if i < len(csv_sensors):
+                            sensor_map[s_id] = csv_sensors[i]
+                        else:
+                            sensor_map[s_id] = None
+
                 # Datenpaket im exakt gleichen Format wie vom SensorManager bauen
                 packet = {'timestamp': csv_time}
                 for s_id in ACTIVE_SENSORS:
-                    try:
-                        w = float(row[f'{s_id}_w'])
-                        x = float(row[f'{s_id}_x'])
-                        y = float(row[f'{s_id}_y'])
-                        z = float(row[f'{s_id}_z'])
-                        packet[s_id] = {'quat': [w, x, y, z]}
-                    except KeyError:
-                        # Fallback, falls ein geforderter Sensor nicht in der CSV ist
+                    csv_id = sensor_map.get(s_id)
+                    if csv_id is not None:
+                        try:
+                            w = float(row[f'{csv_id}_w'])
+                            x = float(row[f'{csv_id}_x'])
+                            y = float(row[f'{csv_id}_y'])
+                            z = float(row[f'{csv_id}_z'])
+                            packet[s_id] = {'quat': [w, x, y, z]}
+                        except KeyError:
+                            packet[s_id] = {'quat': [1.0, 0.0, 0.0, 0.0]}
+                    else:
                         packet[s_id] = {'quat': [1.0, 0.0, 0.0, 0.0]}
                     
                 queue.put(packet)
                 packet_count += 1
+                freq_packet_count += 1
                 
-                # Terminal Feedback
-                if packet_count % (SENSOR_HZ * 2) == 0:
-                    print(f"▶️ Replay läuft... {packet_count} Frames abgespielt")
+                # Berechne und printe echte Abspiel-Frequenz (Hz)
+                curr_time = time.time()
+                elapsed_real = curr_time - freq_last_time
+                if elapsed_real >= 1.0:
+                    hz = freq_packet_count / elapsed_real
+                    print(f"▶️ Replay läuft... \033[93m{hz:.1f} Hz\033[0m ({packet_count} Frames total)")
+                    freq_packet_count = 0
+                    freq_last_time = curr_time
                     
             except Exception as e:
                 print(f"⚠️ Fehler beim Lesen der CSV-Zeile: {e}")

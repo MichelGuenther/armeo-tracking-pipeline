@@ -10,7 +10,7 @@ import numpy as np
 
 
 # --- Imports ---
-from sensor_manager import SensorManager
+from sensor_manager_fast import SensorManager
 from optimizer import Optimizer1D, Optimizer2D_Universal
 
 import queue as std_queue
@@ -26,8 +26,8 @@ import queue as std_queue
 TRACKING_MODE = 'ALL'
 
 # Sensor Bluetooth IDs:
-ID_BASE = 'IMU_9e15c6'   # Torso/Shoulder Base (Sensor 0)
-ID_UPPER = 'IMU_6dee46'  # Upper arm         (Sensor 1)
+ID_BASE = 'IMU_9e15c6' #IMU_5ff6d9'#'IMU_9e15c6'   # Torso/Shoulder Base (Sensor 0)
+ID_UPPER = 'IMU_5ff6d9' #'IMU_6dee46'  # Upper arm  IMU_5ff6d9        (Sensor 1)
 ID_LOWER = 'IMU_c22f23'  # Forearm           (Sensor 2)
 
 if TRACKING_MODE == 'ALL':
@@ -64,25 +64,35 @@ ENABLE_ANTI_WINDUP = True
 #   "kinematic_constraints": Nur das 1D/2D Kinematik-Constraint ohne jede Gelenk-Grenzwerte.
 #   "classic"            : Paper-Constraint + Lineare Strafe bei ROM-Überschreitung.
 #   "dual_seed_referee"  : Experimentell: Dual-Seed Suche (pures Twist-Constraint), gefiltert durch LimRoM.
-LIMROM_MODE_1D = "classic"
-LIMROM_MODE_2D = "off"
+LIMROM_MODE_1D = "dual_seed_referee" # # Für 1D macht der klassische LimRoM-Ansatz wenig Sinn, da wir hier nur 1 Achse haben. Daher nutzen wir den Dual-Seed Referee auch für 1D.
+# Wieder auf 'classic' zurückstellen. 'kinematic_constraints' berechnet 72 (!) LM-Iterationen 
+# pro Fenster im Hintergrund, was zu 1 Sekunde Verzögerung (Hinterherhängen) der Korrektur führt!
+LIMROM_MODE_2D = "dual_seed_referee"
 
 # Valley Jump Retry Validation (set to False to disable ROM checks during retries - for debugging)
 ENABLE_VALLEY_RETRY_VALIDATION = False
 
-TAU_B = 30
-TAU_DELTA = 1
-print(f"Optimierungsparameter: tau_b={TAU_B}, tau_delta={TAU_DELTA}")
+TAU_B_1D = 30
+TAU_DELTA_1D = 1
+
+# Neue Tau Werte für 2D (Schulter)
+# 2D Constraints (nur 1 verbotene Achse) sind flacher/rauschanfälliger als 1D. 
+# Daher machen wir den Filter hier träger (tau_delta = 5 statt 1).
+TAU_B_2D = 15
+TAU_DELTA_2D = 5
+
+print(f"Optimierungsparameter 1D: tau_b={TAU_B_1D}, tau_delta={TAU_DELTA_1D}")
+print(f"Optimierungsparameter 2D: tau_b={TAU_B_2D}, tau_delta={TAU_DELTA_2D}")
 print(f"Filter-Einstellungen: Singularity={ENABLE_SINGULARITY_FILTER}, FlatValley={ENABLE_FLAT_VALLEY_FILTER}, AntiWindup={ENABLE_ANTI_WINDUP}, LimRomMode_1D={LIMROM_MODE_1D}, LimRomMode_2D={LIMROM_MODE_2D}, ValleyRetryValidation={ENABLE_VALLEY_RETRY_VALIDATION}")
 
 # Cost function weight for difference in delta
-OPT_DELTA_DELTA_WEIGHT = 0 # OPT_WINDOW_SIZE / math.pi
+OPT_DELTA_DELTA_WEIGHT = 0#OPT_WINDOW_SIZE / math.pi
 
 # --- LOGGING CONFIGURATION ---
 ENABLE_LOGGING = True
 ENABLE_DEBUG_LOGGING = True
 LOG_DIR = "logs/csv"
-SESSION_NAME = "session_90_get2drom" # Wird in den Dateinamen der Logs eingebaut
+SESSION_NAME = "session_110" # Wird in den Dateinamen der Logs eingebaut
 LOG_FILE_NAME_1D = f"{SESSION_NAME}_1D.csv" # 1D Overall
 LOG_FILE_NAME_2D = f"{SESSION_NAME}_2D.csv"  # 2D Overall
 DEBUG_LOG_FILE_1D = f"{SESSION_NAME}_debug_1D.csv"  # 1D Debug Log
@@ -190,12 +200,12 @@ def viewer_process(queue):
         enable_singularity_filter=ENABLE_SINGULARITY_FILTER,
         enable_flat_valley_filter=ENABLE_FLAT_VALLEY_FILTER,
         enable_anti_windup=ENABLE_ANTI_WINDUP,
-        tau_b_=TAU_B,
-        tau_delta_=TAU_DELTA,
+        tau_b_=TAU_B_1D,
+        tau_delta_=TAU_DELTA_1D,
         delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
         limrom_mode=LIMROM_MODE_1D,
         enable_valley_retry_validation=ENABLE_VALLEY_RETRY_VALIDATION,
-        mode_pure_constraint_referee=(LIMROM_MODE_1D == "dual_seed_referee"),
+        mode_kinematic_constraints=(LIMROM_MODE_1D == "dual_seed_referee"),
         log_file=log_file_1d,
         debug_log_file=debug_log_file_1d
     )
@@ -210,11 +220,11 @@ def viewer_process(queue):
         enable_flat_valley_filter=ENABLE_FLAT_VALLEY_FILTER,
         enable_anti_windup=ENABLE_ANTI_WINDUP,
         limrom_mode=LIMROM_MODE_2D,
-        tau_b_=TAU_B,
-        tau_delta_=TAU_DELTA,
+        tau_b_=TAU_B_2D,
+        tau_delta_=TAU_DELTA_2D,
         delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
         enable_valley_retry_validation=ENABLE_VALLEY_RETRY_VALIDATION,
-        mode_pure_constraint_referee=(LIMROM_MODE_2D == "dual_seed_referee"),
+        mode_kinematic_constraints=(LIMROM_MODE_2D == "dual_seed_referee"),
         log_file=log_file_2d,
         debug_log_file=debug_log_file_2d
     )
@@ -304,8 +314,8 @@ def viewer_process(queue):
                         sx = last_visual_packet['angles_shoulder'].get('x', 0.0)
                         sy = last_visual_packet['angles_shoulder'].get('y', 0.0)
                         ex = last_visual_packet['angle_elbow_x']
-                        ang_info = f" | Schulter: {sx:.1f}°, {sy:.1f}° | Ellenbogen: {ex:.1f}°"
-                    print(f"[{time.strftime('%H:%M:%S')}] ⚙️ System läuft mit: {hz:.1f} Hz (Ziel: {SENSOR_HZ} Hz){ang_info}")
+                        ang_info = f" | Schulter: \033[92m{sx:.1f}°, {sy:.1f}°\033[0m | Ellenbogen: \033[92m{ex:.1f}°\033[0m"
+                    print(f"\033[95m[{time.strftime('%H:%M:%S')}]\033[0m ⚙️ System läuft mit: {hz:.1f} Hz (Ziel: {SENSOR_HZ} Hz){ang_info}")
                 packet_count = 0
                 last_fps_time = current_time
                 

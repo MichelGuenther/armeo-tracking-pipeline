@@ -15,7 +15,7 @@ from optimizer import Optimizer1D, Optimizer2D_Universal
 # ==============================================================================
 
 # Die Raw-Sensor-Aufnahme, die als Grundlage dient
-RAW_CSV_FILE = "logs/raw_sensor_recording_long.csv"  # Ggf. anpassen (z.B. raw_sensor_recording_2.csv)
+RAW_CSV_FILE = "logs/raw_sensor_recording_test.csv"  # Ggf. anpassen (z.B. raw_sensor_recording_2.csv)
 
 # Welche Tau-Werte sollen gegeneinander getestet werden?
 TAU_VALUES_TO_TEST = [1.0, 5.0, 15.0, 30.0]
@@ -38,10 +38,10 @@ OPT_DELTA_DELTA_WEIGHT = OPT_WINDOW_SIZE / math.pi
 
 # --- FILTER-KONFIGURATION: Hier kannst du die Filterfeatures anpassen ---
 ENABLE_SINGULARITY = True
-ENABLE_FLAT_VALLEY = True
+ENABLE_FLAT_VALLEY = False
 ENABLE_ANTI_WINDUP = True
-ENABLE_LIMROM_2D = True
-DELTA_DELTA_WEIGHT = OPT_DELTA_DELTA_WEIGHT
+ENABLE_LIMROM_2D = False
+DELTA_DELTA_WEIGHT = 0#OPT_DELTA_DELTA_WEIGHT
 
 # Kalibrierung aus test_bridge.py
 R_ALIGN_BASE =  R.from_euler('xyz', [-90, 0, 0], degrees=True)
@@ -134,6 +134,7 @@ def main():
                     window_size=OPT_WINDOW_SIZE, step_size=OPT_STEP_SIZE,
                     flat_valley_threshold=OPT_FLAT_VALLEY_THRESHOLD, delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
                     enable_singularity_filter=ENABLE_SINGULARITY, enable_flat_valley_filter=ENABLE_FLAT_VALLEY, enable_anti_windup=ENABLE_ANTI_WINDUP, enable_limrom=ENABLE_LIMROM_2D, tau_b_=tau_b, tau_delta_=tau_d, 
+                    limrom_mode="kinematic_constraints",
                     log_file=log_2d, debug_log_file=None
                 )
                 
@@ -158,46 +159,7 @@ def main():
                             opt_2d.add_packet_and_optimize(r_base, r_up)
                             
                 print(f"✅ tau_b = {tau_b}, tau_delta = {tau_d} fertiggestellt.\n")
-            log_1d = os.path.join(OUTPUT_DIR, f"tau_b_{tau_b}_tau_d_{tau_d}_1D.csv")
-            log_2d = os.path.join(OUTPUT_DIR, f"tau_b_{tau_b}_tau_d_{tau_d}_2D.csv")
-            
-            opt_1d = SyncOptimizer1D(
-                sensor_upper=ID_UPPER, sensor_lower=ID_LOWER, 
-                window_size=OPT_WINDOW_SIZE, step_size=OPT_STEP_SIZE,
-                flat_valley_threshold=OPT_FLAT_VALLEY_THRESHOLD,
-                enable_singularity_filter=ENABLE_SINGULARITY, enable_flat_valley_filter=ENABLE_FLAT_VALLEY, enable_anti_windup=ENABLE_ANTI_WINDUP, tau_b_=tau_b, tau_delta_=tau_d, delta_delta_weight=DELTA_DELTA_WEIGHT,
-                log_file=log_1d, debug_log_file=None # Debug Log aus, da es das Batching extrem verlangsamt
-            )
-            
-            opt_2d = SyncOptimizer2D(
-                sensor_parent=ID_BASE, sensor_child=ID_UPPER, 
-                window_size=OPT_WINDOW_SIZE, step_size=OPT_STEP_SIZE,
-                flat_valley_threshold=OPT_FLAT_VALLEY_THRESHOLD, delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
-                enable_singularity_filter=ENABLE_SINGULARITY, enable_flat_valley_filter=ENABLE_FLAT_VALLEY, enable_anti_windup=ENABLE_ANTI_WINDUP, enable_limrom=ENABLE_LIMROM_2D, tau_b_=tau_b, tau_delta_=tau_d, 
-                log_file=log_2d, debug_log_file=None
-            )
-            
-            print(f"🚀 Starte Verarbeitung für tau_b = {tau_b}, tau_delta = {tau_d}...")
-            
-            # Unterdrücke den massiven Terminal-Spam der Optimizer während der Batch-Verarbeitung
-            with open(os.devnull, 'w') as devnull:
-                with contextlib.redirect_stdout(devnull):
-                    for idx, row in df_raw.iterrows():
-                        # Quaternionen auslesen (Fallback auf Identity, falls fehlerhaft)
-                        q_b = [row.get(f'{ID_BASE}_w', 1), row.get(f'{ID_BASE}_x', 0), row.get(f'{ID_BASE}_y', 0), row.get(f'{ID_BASE}_z', 0)]
-                        q_u = [row.get(f'{ID_UPPER}_w', 1), row.get(f'{ID_UPPER}_x', 0), row.get(f'{ID_UPPER}_y', 0), row.get(f'{ID_UPPER}_z', 0)]
-                        q_l = [row.get(f'{ID_LOWER}_w', 1), row.get(f'{ID_LOWER}_x', 0), row.get(f'{ID_LOWER}_y', 0), row.get(f'{ID_LOWER}_z', 0)]
-                        
-                        # SciPy Format [x,y,z,w] & Alignment
-                        r_base = R.from_quat(np.array([q_b[1], q_b[2], q_b[3], q_b[0]]) * Q_MAP_BASE) * R_ALIGN_BASE
-                        r_up   = R.from_quat(np.array([q_u[1], q_u[2], q_u[3], q_u[0]]) * Q_MAP_UPPER) * R_ALIGN_UPPER
-                        r_low  = R.from_quat(np.array([q_l[1], q_l[2], q_l[3], q_l[0]]) * Q_MAP_LOWER) * R_ALIGN_LOWER
-                        
-                        # In die synchronen Optimizer schieben
-                        opt_1d.add_packet_and_optimize(r_up, r_low)
-                        opt_2d.add_packet_and_optimize(r_base, r_up)
-                        
-            print(f"✅ tau_b = {tau_b}, tau_delta = {tau_d} fertiggestellt und gespeichert.\n")
+
 
     # --- 4. PLOTTING ---
     print("📊 Erstelle Vergleichs-Diagramm...")
