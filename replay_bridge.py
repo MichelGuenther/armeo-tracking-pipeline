@@ -13,7 +13,7 @@ from test_bridge import viewer_process, ACTIVE_SENSORS, SENSOR_HZ
 # ==============================================================================
 
 # Die Datei, die wir mit record_sensor_data.py aufgenommen haben:
-CSV_FILE = "logs/raw_sensor_recording_2.csv"
+CSV_FILE = "logs/raw_sensor_recording_test.csv"
 
 # Wiedergabegeschwindigkeit (1.0 = Echtzeit, 2.0 = Doppelt so schnell).
 # Tipp: Setze es auf 0.0, um die Daten in Sekundenschnelle durch den 

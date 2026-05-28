@@ -10,7 +10,7 @@ import numpy as np
 
 
 # --- Imports ---
-from sensor_manager_fast import SensorManager
+from sensor_manager import SensorManager
 from optimizer import Optimizer1D, Optimizer2D_Universal
 
 import queue as std_queue
@@ -59,15 +59,28 @@ ENABLE_SINGULARITY_FILTER = True
 # Anti-Windup filter
 ENABLE_ANTI_WINDUP = True
 
-# LimRoM Mode for 2D Optimizer
-# Verfügbare Modi für 2D:
-#   "kinematic_constraints": Nur das 1D/2D Kinematik-Constraint ohne jede Gelenk-Grenzwerte.
-#   "classic"            : Paper-Constraint + Lineare Strafe bei ROM-Überschreitung.
-#   "dual_seed_referee"  : Experimentell: Dual-Seed Suche (pures Twist-Constraint), gefiltert durch LimRoM.
-LIMROM_MODE_1D = "dual_seed_referee" # # Für 1D macht der klassische LimRoM-Ansatz wenig Sinn, da wir hier nur 1 Achse haben. Daher nutzen wir den Dual-Seed Referee auch für 1D.
-# Wieder auf 'classic' zurückstellen. 'kinematic_constraints' berechnet 72 (!) LM-Iterationen 
-# pro Fenster im Hintergrund, was zu 1 Sekunde Verzögerung (Hinterherhängen) der Korrektur führt!
-LIMROM_MODE_2D = "dual_seed_referee"
+# LimRoM Mode für beide Optimizer
+# Verfügbare Modi bei BEIDEN Optimizern (1D & 2D):
+#
+#   "kinematic_constraints"
+#   ├─ Cost Function: Nur reine Kinematik (1D: angle_y, angle_z | 2D: angle_z torsion)
+#   ├─ Grid Search: JA (nur Frame 0, danach nur LM)
+#   ├─ Optimierung: 1x LM pro Frame
+#   └─ Best For: Schnell, robust, keine ROM-Penalties
+#
+#   "classic"
+#   ├─ Cost Function: KC + anatomische ROM-Grenzen (LimRoM Penalty)
+#   ├─ Grid Search: JA (nur Frame 0, danach nur LM)
+#   ├─ Optimierung: 1x LM pro Frame (mit Penalties in residuals)
+#   └─ Best For: Anatomisch korrekt, verhindert unmögliche Stellungen
+#
+#   "dual_seed" (unterschiedlich pro Dimension)
+#   ├─ 1D: 1x LM (KC+LimRoM) → evaluiere Mirror-Punkt (180° weg) OHNE zu optimieren → Vergleich
+#   ├─ 2D: 2x LM (zwei Täler parallel) → Referee-Entscheidung basierend auf LimRoM
+#   └─ Best For: Robust gegen Valley-Flips, intelligente Tal-Auswahl
+#
+LIMROM_MODE_1D = "dual_seed"    # Für Ellenbogen (Hinge Joint)
+LIMROM_MODE_2D = "dual_seed"    # Für Schulter (Universal Joint)
 
 # Valley Jump Retry Validation (set to False to disable ROM checks during retries - for debugging)
 ENABLE_VALLEY_RETRY_VALIDATION = False
@@ -88,11 +101,16 @@ print(f"Filter-Einstellungen: Singularity={ENABLE_SINGULARITY_FILTER}, FlatValle
 # Cost function weight for difference in delta
 OPT_DELTA_DELTA_WEIGHT = 0#OPT_WINDOW_SIZE / math.pi
 
+# r_w-adaptive delta_delta weight for 2D (0.0 = disabled)
+# Effective weight = k / r_w²  →  stronger at low observability, relaxed when r_w is high
+# Typical value: 0.001–0.005
+OPT_ADAPTIVE_DELTA_WEIGHT_2D = 0.002
+
 # --- LOGGING CONFIGURATION ---
 ENABLE_LOGGING = True
 ENABLE_DEBUG_LOGGING = True
 LOG_DIR = "logs/csv"
-SESSION_NAME = "session_110" # Wird in den Dateinamen der Logs eingebaut
+SESSION_NAME = "session_121" # Wird in den Dateinamen der Logs eingebaut
 LOG_FILE_NAME_1D = f"{SESSION_NAME}_1D.csv" # 1D Overall
 LOG_FILE_NAME_2D = f"{SESSION_NAME}_2D.csv"  # 2D Overall
 DEBUG_LOG_FILE_1D = f"{SESSION_NAME}_debug_1D.csv"  # 1D Debug Log
@@ -204,8 +222,6 @@ def viewer_process(queue):
         tau_delta_=TAU_DELTA_1D,
         delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
         limrom_mode=LIMROM_MODE_1D,
-        enable_valley_retry_validation=ENABLE_VALLEY_RETRY_VALIDATION,
-        mode_kinematic_constraints=(LIMROM_MODE_1D == "dual_seed_referee"),
         log_file=log_file_1d,
         debug_log_file=debug_log_file_1d
     )
@@ -223,8 +239,7 @@ def viewer_process(queue):
         tau_b_=TAU_B_2D,
         tau_delta_=TAU_DELTA_2D,
         delta_delta_weight=OPT_DELTA_DELTA_WEIGHT,
-        enable_valley_retry_validation=ENABLE_VALLEY_RETRY_VALIDATION,
-        mode_kinematic_constraints=(LIMROM_MODE_2D == "dual_seed_referee"),
+        adaptive_delta_weight_2d=OPT_ADAPTIVE_DELTA_WEIGHT_2D,
         log_file=log_file_2d,
         debug_log_file=debug_log_file_2d
     )
